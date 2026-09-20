@@ -39,6 +39,8 @@ import {
   searchDocumentFieldPathTree,
   documentFilterModeNeedsValue,
   documentFilterModeOptionsFor,
+  documentFilterModeUsesList,
+  documentFilterModeUsesRange,
   documentFilterValueTypeOptions,
   documentStoreProviderFor,
   elasticsearchBoolClauseOptions,
@@ -337,7 +339,20 @@ function documentDataSignature(): string | undefined {
   }
 }
 
-const documentLocalColumnFilterRestoreKey = computed(() => documentDataSignature());
+// Local value filters describe column values, not the rows that happen to be
+// loaded, so paging and page-size changes must not drop them. Only a new query
+// (collection, filter or sort) invalidates the snapshot; restored filters are
+// mapped back by column name, so a changed column set is handled as well.
+function documentLocalColumnFilterSignature(): string | undefined {
+  try {
+    return JSON.stringify([documentStoreProvider.value.kind, props.connectionId, props.database, props.collection, currentDocumentFilter() ?? null, currentDocumentSortJson(sortInput.value) ?? null]);
+  } catch {
+    // Malformed filter/sort JSON: nothing stable to key filters against.
+    return undefined;
+  }
+}
+
+const documentLocalColumnFilterRestoreKey = computed(() => documentLocalColumnFilterSignature());
 
 let loadedDocumentDataSignature: string | undefined;
 
@@ -389,13 +404,11 @@ function handleLocalColumnFiltersChange(filters: SerializedDataGridLocalColumnFi
   persistDocumentBrowserState({ includeData: true });
 }
 
-// Keep these sources in lockstep with documentDataSignature(): every input that
-// invalidates held rows (including pageSize and the infinite-scroll setting, which
-// can change mid-session at page 0 without moving `page`) must also drop the
-// local-filter snapshot, or a tab switch would replay filters the user watched
-// DataGrid clear on its own restore-key change.
+// Keep these sources in lockstep with documentLocalColumnFilterSignature(): a
+// changed query means the local-filter snapshot no longer describes what the
+// user is looking at.
 watch(
-  [filterInput, sortInput, appliedDocumentFilter, page, pageSize, () => settingsStore.editorSettings.infiniteScroll],
+  [filterInput, sortInput, appliedDocumentFilter],
   () => {
     localColumnFilters.value = {};
     localColumnFilterColumns.value = undefined;
@@ -403,6 +416,8 @@ watch(
   },
   { deep: true },
 );
+// Paging and page-size changes reload rows, but the local value filters stay put.
+watch([page, pageSize, () => settingsStore.editorSettings.infiniteScroll], () => persistDocumentBrowserState());
 watch(documentFilterRules, () => persistDocumentBrowserState(), { deep: true });
 
 // Seed the grid from the cached page so a tab switch costs no round trip
@@ -893,6 +908,7 @@ function updateDocumentFilterRule(ruleId: string, patch: Partial<DocumentFilterR
     } else {
       if (patch.fieldName !== undefined && patch.fieldName !== rule.fieldName) next.valueType = "auto";
       if (!documentFilterModeNeedsValue(next.mode)) next.rawValue = "";
+      if (!documentFilterModeUsesRange(next.mode)) next.rawEndValue = "";
     }
     return next;
   });
@@ -3092,8 +3108,39 @@ defineExpose({ focusSearch });
                         </SelectContent>
                       </Select>
 
+                      <div v-if="documentStoreProvider.kind !== 'elasticsearch' && documentFilterModeUsesRange(rule.mode)" class="flex min-w-0 items-center gap-1.5">
+                        <Input
+                          :model-value="rule.rawValue"
+                          class="h-8 min-w-0 flex-1 text-xs"
+                          :placeholder="t('grid.filterBuilderRangeStart')"
+                          @update:model-value="(value) => updateDocumentFilterRule(rule.id, { rawValue: String(value ?? '') })"
+                          @compositionend="endDocumentFilterImeComposition(`value-start:${rule.id}`)"
+                          @compositionstart="startDocumentFilterImeComposition(`value-start:${rule.id}`)"
+                          @keydown="handleDocumentFilterValueKeydown($event, rule.id)"
+                        />
+                        <span class="shrink-0 text-[10px] text-muted-foreground">—</span>
+                        <Input
+                          :model-value="rule.rawEndValue"
+                          class="h-8 min-w-0 flex-1 text-xs"
+                          :placeholder="t('grid.filterBuilderRangeEnd')"
+                          @update:model-value="(value) => updateDocumentFilterRule(rule.id, { rawEndValue: String(value ?? '') })"
+                          @compositionend="endDocumentFilterImeComposition(`value-end:${rule.id}`)"
+                          @compositionstart="startDocumentFilterImeComposition(`value-end:${rule.id}`)"
+                          @keydown="handleDocumentFilterValueKeydown($event, rule.id)"
+                        />
+                      </div>
+                      <textarea
+                        v-else-if="documentStoreProvider.kind !== 'elasticsearch' && documentFilterModeUsesList(rule.mode)"
+                        :value="rule.rawValue"
+                        rows="2"
+                        class="min-h-8 w-full min-w-0 resize-y rounded-md border bg-background px-2 py-1 text-xs outline-none"
+                        :placeholder="t('grid.filterBuilderValues')"
+                        @input="updateDocumentFilterRule(rule.id, { rawValue: ($event.target as HTMLTextAreaElement).value })"
+                        @keydown.ctrl.enter.prevent="applyDocumentStructuredFilters"
+                        @keydown.meta.enter.prevent="applyDocumentStructuredFilters"
+                      />
                       <Input
-                        v-if="documentStoreProvider.kind === 'elasticsearch' ? elasticsearchQueryTypeNeedsValue(rule.elasticsearchQueryType) : documentFilterModeNeedsValue(rule.mode)"
+                        v-else-if="documentStoreProvider.kind === 'elasticsearch' ? elasticsearchQueryTypeNeedsValue(rule.elasticsearchQueryType) : documentFilterModeNeedsValue(rule.mode)"
                         :model-value="rule.rawValue"
                         class="h-8 min-w-0 text-xs"
                         :placeholder="t('grid.filterBuilderValue')"

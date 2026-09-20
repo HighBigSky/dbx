@@ -44,6 +44,7 @@ import type {
   JdbcMavenBundleInfo,
   JdbcPluginStatus,
   SidebarLayout,
+  TableVGroupLayout,
   SavedSqlFile,
   SavedSqlFolder,
   SavedSqlLibrary,
@@ -56,7 +57,7 @@ import { normalizeRustMongoCommand, type MongoCommand } from "@/lib/mongo/mongoS
 import type { MongoBulkWriteResult } from "@/lib/mongo/mongoShellCommand";
 import { BackendErrorException, type BackendError } from "@/lib/backend/errorUtils";
 import { decodeMeilisearchDocumentPage, decodeMeilisearchSearchResult, type MeilisearchDocumentPage, type MeilisearchDocumentPageWire, type MeilisearchSearchResult, type MeilisearchSearchWireResult } from "@/lib/backend/meilisearchTransport";
-import type { CreatedKey, EnqueuedTaskSummary, KeyCreateInput, KeyListItem, KeyPage, KeyUpdateInput, MeilisearchSystemOverview, MeilisearchTask, TaskListInput, TaskPage, TaskSelector } from "@/types/meilisearchManagement";
+import type { CreatedKey, EnqueuedTaskSummary, KeyCreateInput, KeyListItem, KeyPage, KeyUpdateInput, MeilisearchCreateIndexInput, MeilisearchSystemOverview, MeilisearchTask, TaskListInput, TaskPage, TaskSelector } from "@/types/meilisearchManagement";
 import type { CollectionInfo } from "@/types/database";
 import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, SchemaSyncSqlPlan, SelectedSchemaDiffInput, GenerateSchemaSyncPlanOptions, TableDiff, FunctionDiff, SequenceDiff, RuleDiff, OwnerDiff } from "@/lib/schema/schemaDiff";
 import type { SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
@@ -879,7 +880,7 @@ export async function importAgentsFromZip(fileOrPath: string | File, operationId
   });
   if (!res.ok) throw await backendResponseError(res);
   const result: AgentOfflineImportResult = await res.json();
-  return { count: result.count, jreCount: result.jreCount ?? 0 };
+  return { count: result.count, jreCount: result.jreCount ?? 0, failures: result.failures ?? [] };
 }
 
 export async function previewAgentOfflineExport(): Promise<AgentOfflineExportPreview> {
@@ -2541,6 +2542,47 @@ export async function renameSqlFileInFolder(_rootPath: string, _filePath: string
 
 export async function deleteSqlFileInFolder(_rootPath: string, _filePath: string): Promise<void> {
   throw new Error("Managing SQL files in folders is only available in the desktop app");
+}
+
+export interface GlobalSearchRequest {
+  roots: string[];
+  query: string;
+  extensions?: string[];
+  caseSensitive?: boolean;
+  useRegex?: boolean;
+  wholeWord?: boolean;
+  limit?: number;
+}
+
+export interface GlobalSearchMatch {
+  path: string;
+  fileName: string;
+  line: number;
+  column: number;
+  matchText: string;
+  lineText: string;
+}
+
+export async function globalSearch(_request: GlobalSearchRequest): Promise<GlobalSearchMatch[]> {
+  throw new Error("Global content search is only available in the desktop app");
+}
+
+export interface GlobalSearchSettings {
+  roots: string[];
+  extensions: string[];
+}
+
+export async function loadGlobalSearchSettings(): Promise<GlobalSearchSettings | null> {
+  try {
+    const raw = globalThis.localStorage?.getItem("dbx-global-search-settings-disk");
+    return raw ? (JSON.parse(raw) as GlobalSearchSettings) : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveGlobalSearchSettings(settings: GlobalSearchSettings): Promise<void> {
+  globalThis.localStorage?.setItem("dbx-global-search-settings-disk", JSON.stringify(settings));
 }
 
 // ---------------------------------------------------------------------------
@@ -4820,6 +4862,10 @@ export async function meilisearchGetIndexOverview(connectionId: string, index: s
   });
 }
 
+export async function meilisearchCreateIndex(connectionId: string, input: MeilisearchCreateIndexInput): Promise<void> {
+  return post("/api/document-store/meilisearch/index/create", { connectionId, input });
+}
+
 export async function meilisearchDeleteIndex(connectionId: string, index: string): Promise<void> {
   return post("/api/document-store/meilisearch/index/delete", {
     connectionId,
@@ -5045,6 +5091,18 @@ export async function saveSidebarLayout(layout: SidebarLayout): Promise<void> {
 
 export async function loadSidebarLayout(): Promise<SidebarLayout | null> {
   return get("/api/layout/sidebar");
+}
+
+export async function saveTableVGroups(scopeKey: string, layout: TableVGroupLayout): Promise<void> {
+  return post("/api/layout/table-vgroups", { scopeKey, layout });
+}
+
+export async function loadTableVGroups(): Promise<Record<string, TableVGroupLayout>> {
+  return get("/api/layout/table-vgroups");
+}
+
+export async function deleteTableVGroupsForConnection(connectionId: string): Promise<void> {
+  return del(`/api/layout/table-vgroups/connection/${encodeURIComponent(connectionId)}`);
 }
 
 export async function refreshConnections(): Promise<void> {
