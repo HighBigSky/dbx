@@ -299,6 +299,32 @@ describe("DatabaseUserAdmin MySQL privilege editing", () => {
   });
 });
 
+describe("DatabaseUserAdmin MySQL global scope", () => {
+  it("grants the global scope through the fixed entry and hides table scope", async () => {
+    mocks.ensureConnected.mockResolvedValue(undefined);
+    mocks.executeQuery.mockResolvedValueOnce({ columns: ["user", "host", "plugin"], rows: [["root", "%", "caching_sha2_password"]] }).mockResolvedValueOnce({ columns: ["Grants"], rows: [["GRANT SELECT ON *.* TO 'root'@'%'"]] });
+    mocks.listDatabases.mockResolvedValue([{ name: "scope_test" }]);
+
+    root = document.createElement("div");
+    document.body.append(root);
+    app = createApp(DatabaseUserAdmin, { connection: nativeMysqlConnection });
+    app.mount(root);
+    await vi.waitFor(() => expect(mocks.executeQuery).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(findButton("userAdmin.globalScope")).toBeDefined());
+
+    findButton("userAdmin.globalScope")?.click();
+    await nextTick();
+
+    // 全局作用域没有表级粒度，不应出现表范围控件
+    expect(findButton("userAdmin.specificTables")).toBeUndefined();
+
+    findButton("userAdmin.grant")?.click();
+
+    await vi.waitFor(() => expect(root?.textContent).toContain("GRANT SELECT, SHOW VIEW ON *.* TO 'root'@'%';"));
+    expect(root?.textContent).not.toContain("ON `scope_test`.*");
+  });
+});
+
 async function mountNativeMysqlUserAdmin() {
   mocks.ensureConnected.mockResolvedValue(undefined);
   mocks.executeQuery.mockResolvedValueOnce({ columns: ["user", "host", "plugin"], rows: [["same-user", "old-host", "caching_sha2_password"]] }).mockResolvedValueOnce({ columns: ["Grants"], rows: [["GRANT SELECT ON *.* TO 'same-user'@'old-host'"]] });

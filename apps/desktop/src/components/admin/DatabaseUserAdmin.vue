@@ -774,7 +774,11 @@ onMounted(() => {
             </div>
             <label class="flex shrink-0 items-start gap-2 border-t px-3 py-2 text-xs leading-4">
               <input v-model="grantOption" type="checkbox" class="mt-0.5 h-3.5 w-3.5 shrink-0 accent-primary" />
-              <span class="min-w-0 flex-1">{{ privilegeScope === "role" ? t("userAdmin.adminOption") : t("userAdmin.grantOption") }}</span>
+              <span class="min-w-0 flex-1">
+                {{ privilegeScope === "role" ? t("userAdmin.adminOption") : t("userAdmin.grantOption") }}
+                <!-- 撤权语句本身不带 GRANT OPTION，明确说明避免误解 -->
+                <span v-if="privilegeScope !== 'role'" class="mt-0.5 block text-[10px] text-muted-foreground">{{ t("userAdmin.grantOptionHint") }}</span>
+              </span>
             </label>
             <div class="flex shrink-0 items-center justify-end gap-2 border-t p-3">
               <Button v-if="canRevokePrivileges" variant="outline" size="sm" class="h-7 px-2 text-xs" :disabled="usePrivilegeScopeEditor && !privilegeAuthorizationsValid" @click="previewRevoke">

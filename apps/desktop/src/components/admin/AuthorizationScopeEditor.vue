@@ -35,6 +35,8 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
+// 全局作用域标识：MySQL 的 GRANT/REVOKE 支持 ON *.*，权限编辑面板需要保留这一能力
+const GLOBAL_SCOPE = "*";
 const search = ref("");
 // 表列表按库懒加载并缓存，避免下拉展开时重复请求
 const tables = ref<Record<string, string[]>>({});
@@ -47,6 +49,9 @@ const filteredDatabases = computed(() => {
   const query = search.value.trim().toLowerCase();
   return query ? props.databases.filter((database) => database.toLowerCase().includes(query)) : props.databases;
 });
+// 紧凑模式（权限编辑面板）在列表顶部提供固定的「全局」入口，且不受库搜索影响；
+// 新增用户弹窗保持只勾选真实数据库，不改变原有产品行为。
+const visibleDatabases = computed(() => (props.compact ? [GLOBAL_SCOPE, ...filteredDatabases.value] : filteredDatabases.value));
 const selectedDatabaseSet = computed(() => new Set(props.modelValue.map((selection) => selection.database)));
 
 // 同一 tick 内连续触发多次选择变更时（例如连续点击多张表），父组件回流的 props 尚未更新，
@@ -221,11 +226,13 @@ function isPrivilegeSelected(database: string, privilege: string): boolean {
         <Loader2 class="h-3.5 w-3.5 animate-spin" />
         {{ t("userAdmin.loadingDatabases") }}
       </div>
-      <div v-else-if="filteredDatabases.length === 0" class="p-3 text-center text-xs text-muted-foreground">{{ t("userAdmin.emptyDatabases") }}</div>
-      <div v-for="database in filteredDatabases" :key="database" class="border-b p-2" :class="compact ? '' : 'last:border-b-0'">
+      <div v-else-if="visibleDatabases.length === 0" class="p-3 text-center text-xs text-muted-foreground">{{ t("userAdmin.emptyDatabases") }}</div>
+      <div v-for="database in visibleDatabases" :key="database" class="border-b p-2" :class="compact ? '' : 'last:border-b-0'">
         <div class="flex items-center gap-2">
           <input :checked="selectedDatabaseSet.has(database)" type="checkbox" class="h-3.5 w-3.5 accent-primary" @change="toggleDatabase(database)" />
-          <button type="button" class="min-w-0 flex-1 truncate text-left text-xs font-medium" @click="toggleDatabase(database)">{{ database }}</button>
+          <button type="button" class="min-w-0 flex-1 truncate text-left text-xs font-medium" @click="toggleDatabase(database)">
+            {{ database === GLOBAL_SCOPE ? t("userAdmin.globalScope") : database }}
+          </button>
           <Select v-if="selectedDatabaseSet.has(database)" :model-value="selectionFor(database)?.preset" @update:model-value="updatePreset(database, $event)">
             <SelectTrigger class="h-7 text-xs" :class="compact ? 'w-28' : 'w-32'"><SelectValue /></SelectTrigger>
             <SelectContent>
@@ -237,7 +244,7 @@ function isPrivilegeSelected(database: string, privilege: string): boolean {
             </SelectContent>
           </Select>
         </div>
-        <div v-if="supportsTableGrants && selectedDatabaseSet.has(database)" class="mt-2 flex gap-2" :class="compact ? 'flex-col gap-1.5' : 'items-center pl-5'">
+        <div v-if="supportsTableGrants && database !== GLOBAL_SCOPE && selectedDatabaseSet.has(database)" class="mt-2 flex gap-2" :class="compact ? 'flex-col gap-1.5' : 'items-center pl-5'">
           <div class="flex items-center gap-2">
             <span v-if="!compact" class="shrink-0 text-[11px] text-muted-foreground">{{ t("userAdmin.tableScope") }}</span>
             <div class="flex h-7 shrink-0 items-center rounded-md border bg-muted/30 p-0.5">

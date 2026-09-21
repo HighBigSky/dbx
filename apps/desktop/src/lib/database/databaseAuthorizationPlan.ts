@@ -171,7 +171,9 @@ export interface GrantAuthorizationPlanInput {
 export function buildGrantAuthorizationPlan(input: GrantAuthorizationPlanInput): AuthorizationPlan {
   const changePrivilegesSql = input.revoke ? input.provider.revokePrivilegesSql : input.provider.grantPrivilegesSql;
   if (!changePrivilegesSql) return { steps: [] };
-  if (input.provider.dialect !== "mysql") return { steps: [] };
+  // 以 provider 的库/表级授权能力作为判据：Doris / StarRocks 的 dialect 同为 "mysql"，
+  // 但它们的权限名与 MySQL 预设不同（SELECT_PRIV 等），仅比较 dialect 会生成无效语句。
+  if (!input.provider.supportsTableGrantsOnCreate) return { steps: [] };
   const steps: AuthorizationPlanStep[] = [];
   for (const selection of input.databases) {
     const database = selection.database.trim();
