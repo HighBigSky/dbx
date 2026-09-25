@@ -476,6 +476,7 @@ export interface PluginContextMenuContribution {
   description?: string;
   icon?: string;
   menu: PluginContextMenuTarget;
+  action?: PluginOpenWorkbenchTarget;
 }
 
 export interface PluginResultViewContribution {
@@ -490,11 +491,15 @@ export type PluginCommandPresentation = "tab" | "panel";
 export type PluginCommandReuse = "singleton" | "new";
 export type PluginCommandRestore = "none";
 
-/** v1 ships exactly one action (HOST_PLUGIN_UI_SPEC §4.1): open a declared workbench. */
-export interface PluginOpenWorkbenchAction {
+/** Shared wire-level navigation contract used by commands and context-menu contributions. */
+export interface PluginOpenWorkbenchTarget {
   type: "open-workbench";
   /** Workbench contribution of the SAME plugin. */
   workbench: string;
+}
+
+/** v1 command action extends the shared target with command-specific launch behavior. */
+export interface PluginOpenWorkbenchAction extends PluginOpenWorkbenchTarget {
   presentation?: PluginCommandPresentation;
   reuse?: PluginCommandReuse;
   instance_key?: string;
@@ -1180,6 +1185,18 @@ export interface ExtensionInfo {
   schema?: string | null;
 }
 
+/** PostgreSQL event trigger metadata (`pg_event_trigger`). Database-level DDL trigger. */
+export interface EventTriggerInfo {
+  name: string;
+  event: string;
+  owner?: string | null;
+  function?: string | null;
+  enabled?: string | null;
+  tags?: string[] | null;
+  comment?: string | null;
+  source?: string | null;
+}
+
 export interface OwnerInfo {
   object_name: string;
   object_type: string;
@@ -1267,8 +1284,13 @@ export interface QueryResult {
   execution_time_ms: number;
   /** OceanBase SQL Audit EXECUTE_TIME for a completed statement, in microseconds. */
   server_execute_time_us?: number;
-  /** Desktop wait from query request dispatch to the complete result payload; summed across appended pages. OceanBase Oracle query tabs only. */
+  /** Desktop wait from query request dispatch to the complete result payload; summed across appended pages. Completed query/command requests only. */
   client_request_wait_ms?: number;
+  /** Measured phases; totals overlap. Missing phases were not measured. */
+  query_timings_ms?: Record<string, number>;
+  client_prepare_ms?: number;
+  client_result_ms?: number;
+  timing_page_count?: number;
   /** Whether a backend-reported result total is exact. */
   total_is_exact?: boolean;
   truncated?: boolean;
@@ -1514,9 +1536,11 @@ export type TreeNodeType =
   | "group-packages"
   | "group-partitions"
   | "group-extensions"
+  | "group-event-triggers"
   | "group-tablespaces"
   | "group-datafiles"
   | "extension"
+  | "event-trigger"
   | "object-browser"
   | "user-admin"
   | "dameng-users"
@@ -1643,11 +1667,19 @@ export interface TreeNode {
   vgroupId?: string;
   /** 投影时盖章的分组类别（tables/views/…），供拖拽落点 O(1) 类别判定。 */
   vgroupKind?: string;
-  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | ConstraintInfo | PartitionInfo | SubpartitionInfo | ExtensionInfo | VectorCollectionMeta | MongoCollectionMeta | CustomTypeTreeMemberMeta;
+  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | ConstraintInfo | PartitionInfo | SubpartitionInfo | ExtensionInfo | EventTriggerInfo | VectorCollectionMeta | MongoCollectionMeta | CustomTypeTreeMemberMeta;
   loadMore?: {
     parentId: string;
     offset: number;
     pageSize: number;
+    /**
+     * Identity of the row that was expected to open this page: the peek row the
+     * previous page fetched but did not display. Offset paging is not snapshot
+     * consistent, so when objects are created or dropped above the window the
+     * same offset points at a different row; comparing against this anchor lets
+     * the page notice that and re-read the window instead of leaving a gap.
+     */
+    anchor?: string;
   };
 }
 
@@ -1948,6 +1980,8 @@ export interface QueryTab {
     | "plugin-workbench"
     | "plugin-filesystem";
   pluginWorkbench?: {
+    /** Host command that created this tab; distinct commands can share a workbench. */
+    commandId?: string;
     pluginId: string;
     contributionId: string;
     context?: Record<string, unknown>;
