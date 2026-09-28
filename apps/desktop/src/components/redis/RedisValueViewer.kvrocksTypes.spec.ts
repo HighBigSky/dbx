@@ -80,6 +80,7 @@ const testI18nMessages = {
       hyperLogLogHint: "kvrocks HyperLogLog: PFCOUNT cardinality estimate",
       unsupportedValueType: "Viewing this Redis type is not supported yet: {type}",
       unsupportedValueTypeHint: "Proprietary kvrocks type",
+      largeStringPreviewHintUnknown: "This value is large. Only the first {loaded} is loaded, and the preview is read-only.",
     },
   },
 };
@@ -128,6 +129,28 @@ describe("RedisValueViewer kvrocks 专有类型", () => {
     expect(info?.textContent).toContain("1 bytes");
     // 位图写回会改变服务端类型，因此详情面板不出现保存按钮
     expect(document.querySelector("[data-slot='button'][aria-label='grid.save']")).toBeNull();
+  });
+
+  it("截断的 kvrocks 位图显示未知总量的截断提示而不是空文案", async () => {
+    // 超过预览上限时后端拿不到位图准确长度（total_bytes 为空），截断横幅须走未知总量文案
+    mocks.redisGetValue.mockResolvedValue({
+      key_display: "bitmap-key",
+      key_raw: "bitmap-key",
+      ttl: -1,
+      redis_type: "bitmap",
+      data: {
+        kind: "bitmap",
+        content: { raw_base64: "gA==", encoding: "binary" },
+        truncated: true,
+        set_bits: 1,
+      },
+    });
+
+    await mountViewer();
+
+    const banner = document.querySelector("[data-redis-large-string-preview]");
+    expect(banner).not.toBeNull();
+    expect(banner?.textContent).toContain("Only the first 1 B is loaded");
   });
 
   it("HyperLogLog 类型展示 PFCOUNT 基数估计", async () => {

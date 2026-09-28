@@ -667,7 +667,8 @@ const metadataSizeLabel = computed(() => {
 const largeStringPreviewHint = computed(() => {
   const value = data.value;
   const loaded = stringValueDetail.value?.byteCount ?? 0;
-  if (!value || value.data.kind !== "string" || !value.data.truncated) return "";
+  // kvrocks 位图复用字符串截断横幅；截断时后端拿不到准确长度（total_bytes 为空），走未知总量文案
+  if (!value || (value.data.kind !== "string" && value.data.kind !== "bitmap") || !value.data.truncated) return "";
   if (value.data.total_bytes != null) {
     return t("redis.largeStringPreviewHint", { loaded: formatBytes(loaded), total: formatBytes(value.data.total_bytes) });
   }
