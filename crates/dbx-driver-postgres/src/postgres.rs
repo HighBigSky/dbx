@@ -1539,29 +1539,54 @@ where
     Err(errors.into_iter().next_back().unwrap_or_else(|| format!("[postgres][{log_context}] no SQL tiers configured")))
 }
 
-async fn query_with_non_empty_compat_fallback<F, Fut>(
+/// [`query_with_compat_fallback`] variant that also advances past a tier that
+/// *succeeded* without reporting anything the caller can use.
+///
+/// Some PostgreSQL-compatible servers answer the `pg_attribute` metadata tier
+/// for a relation that exists with zero rows (#8728); only a catalog fallback
+/// still reports its columns. A tier that `is_useful` accepts wins immediately,
+/// but the last successful-but-unuseful result is kept so servers that
+/// genuinely have nothing to report — and empty input lists — keep exactly
+/// their previous result instead of turning into an error.
+async fn query_with_useful_compat_fallback<T, F, Fut, P>(
     log_context: &str,
     tiers: &[&'static str],
     mut run: F,
+    is_useful: P,
+) -> Result<T, String>
+where
+    F: FnMut(&'static str) -> Fut,
+    Fut: std::future::Future<Output = Result<T, tokio_postgres::Error>>,
+    P: Fn(&T) -> bool,
+{
+    let mut unuseful_result = None;
+    let mut errors = Vec::new();
+    for sql in tiers {
+        match run(sql).await {
+            Ok(value) if is_useful(&value) => return Ok(value),
+            Ok(value) => unuseful_result = Some(value),
+            Err(error) => errors.push(pg_error_to_string(error)),
+        }
+    }
+    if let Some(value) = unuseful_result {
+        return Ok(value);
+    }
+    log::debug!("[postgres][{log_context}:compat-failed] {}", errors.join("; "));
+    Err(errors.into_iter().next_back().unwrap_or_else(|| format!("[postgres][{log_context}] no SQL tiers configured")))
+}
+
+/// Column-list tier runner: a tier is useful once it reported at least one
+/// column. See [`query_with_useful_compat_fallback`].
+async fn query_with_non_empty_compat_fallback<F, Fut>(
+    log_context: &str,
+    tiers: &[&'static str],
+    run: F,
 ) -> Result<Vec<ColumnInfo>, String>
 where
     F: FnMut(&'static str) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<ColumnInfo>, tokio_postgres::Error>>,
 {
-    let mut empty_result = None;
-    let mut errors = Vec::new();
-    for sql in tiers {
-        match run(sql).await {
-            Ok(columns) if !columns.is_empty() => return Ok(columns),
-            Ok(columns) => empty_result = Some(columns),
-            Err(error) => errors.push(pg_error_to_string(error)),
-        }
-    }
-    if let Some(columns) = empty_result {
-        return Ok(columns);
-    }
-    log::debug!("[postgres][{log_context}:compat-failed] {}", errors.join("; "));
-    Err(errors.into_iter().next_back().unwrap_or_else(|| format!("[postgres][{log_context}] no SQL tiers configured")))
+    query_with_useful_compat_fallback(log_context, tiers, run, |columns: &Vec<ColumnInfo>| !columns.is_empty()).await
 }
 
 fn pg_db_error_to_string(err: &tokio_postgres::error::DbError) -> String {
@@ -4533,9 +4558,12 @@ pub async fn get_columns_for_relations(
     let oids: Vec<i64> = relations.iter().map(|(oid, _, _)| *oid).collect();
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let tiers = postgres_columns_for_relations_query_tiers();
-    query_with_compat_fallback("get_columns_for_relations", &tiers, |sql| {
-        get_columns_for_relations_with_sql(&client, sql, &oids)
-    })
+    query_with_useful_compat_fallback(
+        "get_columns_for_relations",
+        &tiers,
+        |sql| get_columns_for_relations_with_sql(&client, sql, &oids),
+        |columns_by_oid: &HashMap<i64, Vec<ColumnInfo>>| columns_by_oid.values().any(|columns| !columns.is_empty()),
+    )
     .await
 }
 
@@ -4553,8 +4581,12 @@ async fn get_columns_for_relations_with_sql(
     Ok(result)
 }
 
-fn postgres_columns_for_relations_query_tiers() -> [&'static str; 2] {
-    [postgres_columns_for_relations_sql(), postgres_columns_for_relations_compat_sql()]
+fn postgres_columns_for_relations_query_tiers() -> [&'static str; 3] {
+    [
+        postgres_columns_for_relations_sql(),
+        postgres_columns_for_relations_compat_sql(),
+        postgres_columns_for_relations_information_schema_sql(),
+    ]
 }
 
 // Sibling of `POSTGRES_COLUMNS_SQL`/`POSTGRES_COLUMNS_COMPAT_SQL` below (~line
@@ -4696,6 +4728,46 @@ fn postgres_columns_for_relations_compat_sql() -> &'static str {
              WHERE c.oid = ANY($1::bigint[]) \
              AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY c.oid, a.attnum"
+}
+
+// Information-schema sibling of `POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL`
+// (~line 7520), batched by oid. Last-resort tier: a server whose
+// `pg_attribute` rows for an existing relation come back empty (#8728) still
+// gets its column list back. It cannot report comments, extras or enum labels,
+// so those positions stay NULL exactly like the single-relation version's.
+// Keep `relid` first and every field in the same order as the two
+// `pg_attribute` tiers — `column_info_from_row_offset` decodes the row by
+// position.
+fn postgres_columns_for_relations_information_schema_sql() -> &'static str {
+    "SELECT c.oid::bigint AS relid, ic.column_name AS column_name, \
+             CASE WHEN ic.data_type = 'USER-DEFINED' THEN ic.udt_name ELSE ic.data_type END AS full_type, \
+             ic.is_nullable = 'YES' AS is_nullable, \
+             ic.column_default AS column_default, \
+             EXISTS ( \
+               SELECT 1 FROM information_schema.table_constraints tc \
+               JOIN information_schema.key_column_usage kcu \
+                 ON kcu.constraint_catalog = tc.constraint_catalog \
+                AND kcu.constraint_schema = tc.constraint_schema \
+                AND kcu.constraint_name = tc.constraint_name \
+                AND kcu.table_schema = tc.table_schema \
+                AND kcu.table_name = tc.table_name \
+               WHERE tc.constraint_type = 'PRIMARY KEY' \
+                 AND tc.table_schema = ic.table_schema \
+                 AND tc.table_name = ic.table_name \
+                 AND kcu.column_name = ic.column_name \
+             ) AS is_pk, \
+             NULL::text AS column_comment, \
+             NULL::text AS column_extra, \
+             CAST(ic.numeric_precision AS int) AS numeric_precision, \
+             CAST(ic.numeric_scale AS int) AS numeric_scale, \
+             CAST(ic.character_maximum_length AS int) AS character_maximum_length, \
+             NULL::text AS enum_values \
+             FROM information_schema.columns ic \
+             JOIN pg_catalog.pg_namespace n ON n.nspname = ic.table_schema \
+             JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = ic.table_name \
+             WHERE ic.table_catalog = current_database() \
+             AND c.oid = ANY($1::bigint[]) \
+             ORDER BY c.oid, ic.ordinal_position"
 }
 
 /// Same field layout as `column_info_from_row`, offset by one leading `relid`
@@ -5204,9 +5276,11 @@ fn postgres_check_constraints_sql() -> &'static str {
 pub async fn list_constraints(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ConstraintInfo>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_constraints_sql(), &[&schema, &table])
-        .await
-        .map_err(|e| e.to_string())?;
+    let tiers = postgres_constraint_query_tiers();
+    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&schema, &table];
+    let rows =
+        query_with_compat_fallback("list_constraints", &tiers, |sql| postgres_query_cached(&client, sql, &params))
+            .await?;
 
     Ok(rows
         .iter()
@@ -5423,6 +5497,48 @@ fn postgres_constraints_sql() -> &'static str {
          FROM unnest(con.confkey) WITH ORDINALITY AS ord(attnum, ord) \
          JOIN pg_catalog.pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = ord.attnum AND NOT a.attisdropped \
      ) confkey ON true \
+     WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','f') \
+     ORDER BY con.conname"
+}
+
+fn postgres_constraint_query_tiers() -> [&'static str; 2] {
+    [postgres_constraints_sql(), postgres_constraints_compat_sql()]
+}
+
+/// PostgreSQL 9.2/9.3 sibling of [`postgres_constraints_sql`]: those servers
+/// have neither `LATERAL` (9.3+) nor `unnest(...) WITH ORDINALITY` (9.4+), so
+/// the whole-table DDL/metadata path used to fail with a bare `db error`
+/// (#10079). `generate_subscripts` plus a correlated scalar subquery produce
+/// the same column arrays on every supported server.
+fn postgres_constraints_compat_sql() -> &'static str {
+    "SELECT con.conname, \
+            con.contype::text, \
+            pg_catalog.pg_get_constraintdef(con.oid, true) AS definition, \
+            COALESCE(( \
+                SELECT array_agg(a.attname::text ORDER BY key_order.ord) \
+                FROM generate_subscripts(con.conkey, 1) AS key_order(ord) \
+                JOIN pg_catalog.pg_attribute a \
+                  ON a.attrelid = con.conrelid AND a.attnum = con.conkey[key_order.ord] AND NOT a.attisdropped \
+            ), ARRAY[]::text[]) AS columns, \
+            refn.nspname AS ref_schema, \
+            refc.relname AS ref_table, \
+            COALESCE(( \
+                SELECT array_agg(a.attname::text ORDER BY key_order.ord) \
+                FROM generate_subscripts(con.confkey, 1) AS key_order(ord) \
+                JOIN pg_catalog.pg_attribute a \
+                  ON a.attrelid = con.confrelid AND a.attnum = con.confkey[key_order.ord] AND NOT a.attisdropped \
+            ), ARRAY[]::text[]) AS ref_columns, \
+            CASE WHEN con.contype = 'f' THEN con.confmatchtype::text END AS match_type, \
+            CASE WHEN con.contype = 'f' THEN con.confupdtype::text END AS on_update, \
+            CASE WHEN con.contype = 'f' THEN con.confdeltype::text END AS on_delete, \
+            con.condeferrable, \
+            con.condeferred, \
+            con.convalidated \
+     FROM pg_catalog.pg_constraint con \
+     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     LEFT JOIN pg_catalog.pg_class refc ON refc.oid = con.confrelid \
+     LEFT JOIN pg_catalog.pg_namespace refn ON refn.oid = refc.relnamespace \
      WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','f') \
      ORDER BY con.conname"
 }
@@ -13225,6 +13341,50 @@ mod tests {
     }
 
     #[test]
+    fn postgres_constraint_tiers_keep_the_compat_sibling_first_usable() {
+        let tiers = postgres_constraint_query_tiers();
+        assert_eq!(tiers[0], postgres_constraints_sql());
+        assert_eq!(tiers[1], postgres_constraints_compat_sql());
+    }
+
+    #[test]
+    fn postgres_constraints_compat_sql_avoids_lateral_and_ordinality() {
+        let sql = postgres_constraints_compat_sql();
+        // PostgreSQL 9.2/9.3 fail on the primary query's `LEFT JOIN LATERAL`
+        // (9.3+) and `unnest(...) WITH ORDINALITY` (9.4+); the compat tier must
+        // not reference either, or table DDL export keeps reporting `db error`.
+        assert!(!sql.contains("LATERAL"));
+        assert!(!sql.contains("WITH ORDINALITY"));
+        assert!(!sql.contains("unnest("));
+        assert!(sql.contains("generate_subscripts(con.conkey, 1)"));
+        assert!(sql.contains("generate_subscripts(con.confkey, 1)"));
+        // Same projection, in the same order, as the primary query so
+        // `list_constraints`' positional row mapping stays valid.
+        for column in [
+            "con.conname",
+            "con.contype::text",
+            "pg_catalog.pg_get_constraintdef(con.oid, true) AS definition",
+            "AS columns",
+            "refn.nspname AS ref_schema",
+            "refc.relname AS ref_table",
+            "AS ref_columns",
+            "AS match_type",
+            "AS on_update",
+            "AS on_delete",
+            "con.condeferrable",
+            "con.condeferred",
+            "con.convalidated",
+        ] {
+            assert!(sql.contains(column), "compat constraints SQL is missing {column}");
+        }
+        assert_eq!(sql.matches("attname::text").count(), 2);
+        assert!(sql.contains("a.attisdropped"));
+        assert!(sql.contains("n.nspname = $1 AND c.relname = $2"));
+        assert!(sql.contains("c.relkind IN ('r','p','f')"));
+        assert!(sql.contains("ORDER BY con.conname"));
+    }
+
+    #[test]
     fn opengauss_constraint_sql_avoids_array_and_ordinality_dependencies() {
         let sql = opengauss_constraints_sql(true);
         assert!(sql.contains("con.conkey::text"));
@@ -13375,13 +13535,17 @@ mod tests {
     #[test]
     fn postgres_partition_batch_metadata_uses_bounded_compat_tiers() {
         let column_tiers = postgres_columns_for_relations_query_tiers();
-        assert_eq!(column_tiers.len(), 2);
+        // Two `pg_attribute` tiers plus the information-schema last resort
+        // (#8728); still bounded, and a normal server stops at the first tier.
+        assert_eq!(column_tiers.len(), 3);
         assert!(column_tiers.iter().all(|sql| sql.contains("c.oid = ANY($1::bigint[])")));
         assert!(column_tiers[0].contains("a.attgenerated"));
         assert!(!column_tiers[1].contains("a.attgenerated"));
         assert!(!column_tiers[1].contains("pg_sequence"));
         assert!(column_tiers[1].contains("sequence_dep.deptype = 'a'"));
         assert!(!column_tiers[1].contains("LEFT JOIN LATERAL"));
+        assert!(column_tiers[2].contains("information_schema.columns"));
+        assert!(!column_tiers[2].contains("pg_attribute"));
 
         let index_tiers = postgres_indexes_for_relations_query_tiers();
         assert_eq!(index_tiers.len(), 2);
@@ -13447,6 +13611,96 @@ mod tests {
         assert!(POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL.contains("NULL::text AS enum_values"));
         assert!(!POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL.contains("pg_attribute"));
         assert!(!POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL.contains("regclass"));
+    }
+
+    /// #8728: the batched (partition-tree) column path used to be the only
+    /// metadata path without a catalog fallback, so a server that answers the
+    /// `pg_attribute` tiers with zero rows for an existing relation still
+    /// reported no columns. It now carries the same information-schema last
+    /// resort as the single-relation path.
+    #[test]
+    fn postgres_batched_column_metadata_has_information_schema_fallback() {
+        let tiers = postgres_columns_for_relations_query_tiers();
+        assert_eq!(tiers.len(), 3);
+
+        let sql = postgres_columns_for_relations_information_schema_sql();
+        assert!(sql.contains("information_schema.columns"));
+        assert!(sql.contains("information_schema.table_constraints"));
+        assert!(sql.contains("information_schema.key_column_usage"));
+        assert!(!sql.contains("pg_attribute"));
+        assert!(!sql.contains("regclass"));
+        // `relid` must stay first, and the ignored positions must stay NULL, so
+        // `column_info_from_row_offset` can decode this tier unchanged.
+        assert!(sql.starts_with("SELECT c.oid::bigint AS relid, ic.column_name AS column_name,"));
+        assert!(sql.contains("NULL::text AS column_comment"));
+        assert!(sql.contains("NULL::text AS column_extra"));
+        assert!(sql.contains("NULL::text AS enum_values"));
+        assert!(sql.contains("WHERE ic.table_catalog = current_database()"));
+        assert!(sql.contains("AND c.oid = ANY($1::bigint[])"));
+    }
+
+    #[tokio::test]
+    async fn useful_fallback_advances_past_a_tier_that_reported_nothing() {
+        let tiers: [&'static str; 3] = ["attributes", "compat-attributes", "information-schema"];
+        let calls = Cell::new(Vec::<&'static str>::new());
+        let result = query_with_useful_compat_fallback(
+            "test",
+            &tiers,
+            |sql| {
+                calls.set({
+                    let mut seen = calls.take();
+                    seen.push(sql);
+                    seen
+                });
+                async move {
+                    let mut columns_by_oid: HashMap<i64, Vec<ColumnInfo>> = HashMap::new();
+                    if sql == "information-schema" {
+                        columns_by_oid.insert(7, vec![ColumnInfo { name: "id".to_string(), ..Default::default() }]);
+                    }
+                    Ok(columns_by_oid)
+                }
+            },
+            |columns_by_oid: &HashMap<i64, Vec<ColumnInfo>>| columns_by_oid.values().any(|columns| !columns.is_empty()),
+        )
+        .await
+        .expect("a tier with columns must win");
+
+        assert_eq!(calls.take(), vec!["attributes", "compat-attributes", "information-schema"]);
+        assert_eq!(result.get(&7).map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn useful_fallback_keeps_the_last_empty_result_when_no_tier_is_useful() {
+        let tiers: [&'static str; 2] = ["attributes", "information-schema"];
+        let result: Result<HashMap<i64, Vec<ColumnInfo>>, String> = query_with_useful_compat_fallback(
+            "test",
+            &tiers,
+            |_sql| async move { Ok(HashMap::<i64, Vec<ColumnInfo>>::new()) },
+            |columns_by_oid: &HashMap<i64, Vec<ColumnInfo>>| columns_by_oid.values().any(|columns| !columns.is_empty()),
+        )
+        .await;
+
+        assert_eq!(result.expect("an empty-but-successful tier is not an error").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn useful_fallback_reports_the_last_error_when_every_tier_fails() {
+        let tiers: [&'static str; 2] = ["attributes", "information-schema"];
+        let error =
+            query_with_useful_compat_fallback(
+                "test",
+                &tiers,
+                |_sql| async move {
+                    Err::<HashMap<i64, Vec<ColumnInfo>>, _>(tokio_postgres::Error::__private_api_timeout())
+                },
+                |columns_by_oid: &HashMap<i64, Vec<ColumnInfo>>| {
+                    columns_by_oid.values().any(|columns| !columns.is_empty())
+                },
+            )
+            .await
+            .expect_err("every tier failed");
+
+        assert!(!error.is_empty());
     }
 
     #[test]

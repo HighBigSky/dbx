@@ -255,6 +255,7 @@ export const listDialectDataTypes = forward("listDialectDataTypes");
 
 // Docs
 export const collectDocsSnapshot = forward("collectDocsSnapshot");
+export const collectDocsSnapshotForExport = forward("collectDocsSnapshotForExport");
 export const loadDocsAnnotations = forward("loadDocsAnnotations");
 export const applyDocsAnnotations = forward("applyDocsAnnotations");
 export const saveDocsAnnotations = forward("saveDocsAnnotations");
@@ -379,6 +380,8 @@ export const saveSqlFileUploadMaxMb = forward("saveSqlFileUploadMaxMb");
 export const saveMaxAgentTurns = forward("saveMaxAgentTurns");
 export const loadHistoryRetentionLimit = forward("loadHistoryRetentionLimit");
 export const saveHistoryRetentionLimit = forward("saveHistoryRetentionLimit");
+export const loadMcpHistoryRetentionLimit = forward("loadMcpHistoryRetentionLimit");
+export const saveMcpHistoryRetentionLimit = forward("saveMcpHistoryRetentionLimit");
 export const loadMaxRetries = forward("loadMaxRetries");
 export const saveMaxRetries = forward("saveMaxRetries");
 export const completeAppClose = forward("completeAppClose");
@@ -763,12 +766,14 @@ export const mqCreateNamespace = forward("mqCreateNamespace");
 export const mqDeleteNamespace = forward("mqDeleteNamespace");
 export const mqGetNamespacePolicies = forward("mqGetNamespacePolicies");
 export const mqListTopics = forward("mqListTopics");
+export const mqListTopicsPage = forward("mqListTopicsPage");
 export const mqCreateTopic = forward("mqCreateTopic");
 export const mqDeleteTopic = forward("mqDeleteTopic");
 export const mqUpdatePartitions = forward("mqUpdatePartitions");
 export const mqGetTopicStats = forward("mqGetTopicStats");
 export const mqGetTopicInternalStats = forward("mqGetTopicInternalStats");
 export const mqListExchanges = forward("mqListExchanges");
+export const mqListExchangesPage = forward("mqListExchangesPage");
 export const mqCreateExchange = forward("mqCreateExchange");
 export const mqDeleteExchange = forward("mqDeleteExchange");
 export const mqListBindings = forward("mqListBindings");
@@ -915,6 +920,8 @@ export const searchHistory = forward("searchHistory");
 export const loadHistoryConnectionOptions = forward("loadHistoryConnectionOptions");
 export const loadRedisHistory = forward("loadRedisHistory");
 export const clearHistory = forward("clearHistory");
+export const clearHistoryBySource = forward("clearHistoryBySource");
+export const cleanupMcpHistoryRetention = forward("cleanupMcpHistoryRetention");
 export const clearRedisHistory = forward("clearRedisHistory");
 export const deleteHistoryEntry = forward("deleteHistoryEntry");
 
@@ -929,6 +936,8 @@ export const saveMcpHttpServerSettings = forward("saveMcpHttpServerSettings");
 export const mcpHttpServerStatus = forward("mcpHttpServerStatus");
 export const rotateMcpHttpServerToken = forward("rotateMcpHttpServerToken");
 export const loadWebMcpHttpStatus = forward("loadWebMcpHttpStatus");
+export const saveWebMcpHttpSettings = forward("saveWebMcpHttpSettings");
+export const rotateWebMcpToken = forward("rotateWebMcpToken");
 export const checkForUpdates = forward("checkForUpdates");
 export const fetchChangelog = forward("fetchChangelog");
 export const getSystemProxyUrl = forward("getSystemProxyUrl");
@@ -998,6 +1007,7 @@ export type {
   McpHttpServerSettings,
   McpHttpServerStatus,
   WebMcpHttpStatus,
+  WebMcpHttpSettings,
   UpdateInfo,
   DownloadedUpdate,
   RedisBlob,
@@ -1086,6 +1096,7 @@ export type {
   TransferOwnershipPolicy,
   TransferOwnershipPreview,
   TableImportMode,
+  TableImportConflictPolicy,
   TableImportStatus,
   TableImportSourceFormat,
   TableImportJsonShape,
