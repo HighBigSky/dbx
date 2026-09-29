@@ -40,8 +40,19 @@ const SQL_STATEMENT_START_RE =
  * `sql = `、`String sql = `、`final String SQL = `、`query := `、`const q = `。
  * 末尾允许一个左括号（覆盖 `sql = ("..." "..." )` 这种写法）。
  * 前缀里不允许出现引号，因此不会吞掉字面量本身。
+ * 捕获组 1 为 `=` 之前的前缀文本、捕获组 2 为赋值操作符，用于区分
+ * 声明性赋值与裸标识符赋值（见 DECLARATION_KEYWORD_RE）。
  */
-const ASSIGNMENT_PREFIX_RE = /^[A-Za-z0-9_$.[\]<>,:\s]*?(?:=|:=)\s*\(?\s*/;
+const ASSIGNMENT_PREFIX_RE = /^([A-Za-z0-9_$.[\]<>,:\s]*?)(:?=)\s*\(?\s*/;
+
+/**
+ * 判定赋值前缀是否「声明性」：出现声明关键字（Java/Kotlin/JS/TS/Go 的
+ * 类型或 var/const/let/final/val 等）。`:=`（Go 短声明）也视为声明。
+ * 裸标识符赋值（如 `status = 'DELETE'`）不算声明：单个字面量不足以证明
+ * 这是「从源码复制的 SQL」，只有出现两个字面量以上的拼接时才还原，
+ * 避免把条件片段里的单个 SQL 关键字字符串误改写。
+ */
+const DECLARATION_KEYWORD_RE = /(?:^|[^A-Za-z0-9_$])(?:string|const|let|var|final|val|def|dim|static)(?:[^A-Za-z0-9_$]|$)/i;
 
 /** 结尾允许出现的收尾字符：空白、行继续符、闭合括号与语句结束分号 */
 const TRAILING_TAIL_RE = /^[\s\\]*\)*[\s\\]*;?[\s\\]*$/;
@@ -83,7 +94,7 @@ function skipBlank(source: string, from: number): number {
 
 /**
  * 反解「转义字符串」里的转义序列（Java/JS/Python 等非 raw 字面量通用规则）。
- * 未知转义只去掉反斜杠，尽量保留用户内容。
+ * 未知转义保留反斜杠本身（JS/Python 语义），避免改写 LIKE 模式等内容。
  */
 function unescapeLiteralContent(raw: string): string {
   let out = "";
@@ -144,9 +155,18 @@ function unescapeLiteralContent(raw: string): string {
         }
         break;
       }
-      default:
-        // \" \' \\ \` \/ 等：去掉反斜杠本身
+      case "'":
+      case '"':
+      case "`":
+      case "\\":
+      case "/":
+        // 引号/反斜杠/斜杠的恒等转义：去掉反斜杠本身
         out += next;
+        break;
+      default:
+        // 未知转义：JS/Python 语义是保留反斜杠（如 LIKE '100\%'），
+        // Java 里未知转义本就是编译错误，保留反斜杠更贴近用户原文
+        out += "\\" + next;
         break;
     }
   }
@@ -266,7 +286,12 @@ function isLiteralSeparator(between: string, sawConnector: boolean): boolean {
 function parseSourceSqlLiterals(source: string): string[] | null {
   let pos = 0;
   const prefixMatch = source.match(ASSIGNMENT_PREFIX_RE);
-  if (prefixMatch) pos = prefixMatch[0].length;
+  let bareAssignment = false;
+  if (prefixMatch) {
+    // 裸标识符赋值（无声明关键字且不是 :=）：只有多字面量拼接才算源码 SQL
+    bareAssignment = prefixMatch[2] !== ":=" && !DECLARATION_KEYWORD_RE.test(prefixMatch[1]);
+    pos = prefixMatch[0].length;
+  }
   pos = skipBlank(source, pos);
 
   const first = readLiteralAtCursor(source, pos);
@@ -286,7 +311,9 @@ function parseSourceSqlLiterals(source: string): string[] | null {
     const next = readLiteralAtCursor(source, cursor);
     if (!next) {
       // 没有更多字面量：只允许「空白 + 可选右括号/分号」收尾
-      return TRAILING_TAIL_RE.test(source.slice(gapStart)) ? fragments : null;
+      if (!TRAILING_TAIL_RE.test(source.slice(gapStart))) return null;
+      if (bareAssignment && fragments.length < 2) return null;
+      return fragments;
     }
     if (!isLiteralSeparator(source.slice(gapStart, cursor), sawConnector)) return null;
     fragments.push(next.content);

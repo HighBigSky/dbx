@@ -18,6 +18,35 @@ describe("restoreSqlFromSourcePaste", () => {
     });
   });
 
+  it("leaves bare single-literal assignments that only contain a keyword untouched", () => {
+    expect(restoreSqlFromSourcePaste("status = 'DELETE'")).toEqual({ sql: "status = 'DELETE'", changed: false });
+    expect(restoreSqlFromSourcePaste("users.name = 'DESC'")).toEqual({ sql: "users.name = 'DESC'", changed: false });
+    expect(restoreSqlFromSourcePaste("label = 'select'")).toEqual({ sql: "label = 'select'", changed: false });
+  });
+
+  it("restores bare assignments only when multiple literals are concatenated", () => {
+    const source = 'sql = "SELECT * " +\n     "FROM users"';
+    expect(restoreSqlFromSourcePaste(source)).toEqual({
+      sql: "SELECT * FROM users",
+      changed: true,
+    });
+  });
+
+  it("restores Go short-declaration assignments with a single literal", () => {
+    expect(restoreSqlFromSourcePaste('query := "SELECT 1"')).toEqual({
+      sql: "SELECT 1",
+      changed: true,
+    });
+  });
+
+  it("keeps unknown escape sequences intact for LIKE patterns", () => {
+    const source = "\"SELECT * FROM t WHERE name LIKE '100\\%'\"";
+    expect(restoreSqlFromSourcePaste(source)).toEqual({
+      sql: "SELECT * FROM t WHERE name LIKE '100\\%'",
+      changed: true,
+    });
+  });
+
   it("joins implicitly concatenated Python literals", () => {
     const source = ['sql = ("SELECT * "', '       "FROM users "', '       "WHERE id = 1")'].join("\n");
     expect(restoreSqlFromSourcePaste(source)).toEqual({
