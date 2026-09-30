@@ -202,6 +202,7 @@ import {
   isDeleteCurrentRowShortcut,
   isEditTableStructureShortcut,
   isFocusSearchShortcut,
+  isFocusWhereShortcut,
   isGoToColumnShortcut,
   isGoToFirstPageShortcut,
   isGoToLastPageShortcut,
@@ -217,6 +218,7 @@ import {
   canGoNextDataGridPage,
   dataGridLoadAllSegment,
   dataGridTotalRowCountLabelKey,
+  dataGridUserFacingPage,
   dataGridTruncationHintKey,
   ELASTICSEARCH_PAGE_JUMP_WARNING_REQUESTS,
   elasticsearchCursorPageJumpRequestCount,
@@ -501,6 +503,13 @@ interface DataGridProps {
   autoShowTableInfo?: boolean;
   pageOffset?: number;
   pageLimit?: number;
+  /**
+   * Pagination of the segment that produced the currently displayed rows. It
+   * differs from `pageOffset`/`pageLimit` once a result was extended by
+   * "load all" or infinite scroll, because those stay on the logical first page.
+   */
+  executedPageOffset?: number;
+  executedPageLimit?: number;
   countSql?: string;
   totalRowCount?: number;
   totalRowCountIsExact?: boolean;
@@ -750,7 +759,7 @@ const resolvedDatabaseType = computed(() => props.databaseType ?? effectiveDatab
 // editor and clipboard path must decode it whenever MongoDB values are on screen.
 const usesMongoDocumentGridValues = computed(() => props.mongoCollectionGrid === true || resolvedDatabaseType.value === "mongodb");
 const isResultsContext = computed(() => props.context === "results");
-const canShowWhereSearch = computed(() => !!props.onExecuteSql && !isResultsContext.value && resolvedDatabaseType.value !== "victoriametrics");
+const canShowWhereSearch = computed(() => !!props.onExecuteSql && !isResultsContext.value && resolvedDatabaseType.value !== "victoriametrics" && resolvedDatabaseType.value !== "nebula");
 const canUseWhereSearch = computed(() => !!props.tableMeta && canShowWhereSearch.value);
 const canUseServerColumnFilter = computed(() => canUseWhereSearch.value && !!props.connectionId && !!props.tableMeta);
 const tableStructureCapabilities = computed(() => getTableStructureCapabilities(resolvedDatabaseType.value, resolvedConnectionConfig.value?.db_type));
@@ -1063,6 +1072,7 @@ const transposeScrollRef = ref<HTMLElement | { $el?: HTMLElement }>();
 const transposeScrollLeft = ref(0);
 const transposeViewportWidth = ref(0);
 const { sortColumn: sortCol, sortColumnIndex: sortColIndex, sortDirection: sortDir, sortMode, setSort, clearSort } = useDataGridSort();
+const queryControlsRef = ref<InstanceType<typeof DataGridQueryControls>>();
 const searchBarRef = ref<{ focus: (select?: boolean) => void } | null>(null);
 const replaceOpen = ref(false);
 const replacementText = ref("");
@@ -1881,6 +1891,11 @@ function navigateSuggestion(delta: number) {
   dataGridSearch.navigateSuggestion(delta);
 }
 
+function focusWhere(): boolean {
+  if (!canUseWhereSearch.value) return false;
+  return queryControlsRef.value?.focusWhere() ?? false;
+}
+
 function focusSearch(target: Element | null = null): boolean {
   const tableInfoDrawer = target?.closest<HTMLElement>("[data-table-info-drawer]");
   if (tableInfoDrawer) {
@@ -2080,6 +2095,17 @@ const goToColumnOpen = ref(false);
 const goToColumnSearch = ref("");
 const goToColumnSearchInput = ref<HTMLInputElement>();
 const goToColumnListRef = ref<HTMLElement>();
+// The trigger lives inside a Tooltip so the icon keeps its hover hint, and that
+// tooltip claims the popper anchor for its own popper root. Pointing the popover at
+// the button element directly keeps the column list positioned on screen.
+const goToColumnTriggerRef = ref<HTMLElement | { $el?: HTMLElement }>();
+
+function goToColumnTriggerElement(): HTMLElement | undefined {
+  const trigger = goToColumnTriggerRef.value;
+  if (!trigger) return undefined;
+  return trigger instanceof HTMLElement ? trigger : trigger.$el;
+}
+
 const goToColumnSelectedIndex = ref(0);
 const columnOrderKeys = computed(() => uniqueDataGridColumnOrderKeys(props.result.columns, props.sourceColumns));
 const resolvedColumnLayoutScopeKey = computed(
@@ -6300,6 +6326,19 @@ watch(valueEditorContainer, async (el) => {
       onBlur: () => {
         if (!detailValueDiffOpen.value && !detailTransformOpen.value) commitValueEditorEdit();
       },
+      // 非 temporal 值编辑器（CodeMirror）里按 Ctrl/Cmd+S：仅靠网格全局快捷键不会把
+      // 草稿提交成待保存变更，必须在这里认领保存键——先 commitValueEditorEdit 落脏，
+      // 再触发保存（#10515；temporal 走 @save→onTemporalCellEditorSave）。
+      // useCellDetailEditor 对每个 keydown 都会回调本钩子，必须先用 isSaveShortcut
+      // 过滤：否则普通按键也被吞掉（preventDefault），编辑器将完全无法输入。
+      onSaveShortcut: (event) => {
+        if (!isSaveShortcut(event, settingsStore.editorSettings.shortcuts)) return false;
+        commitValueEditorEdit();
+        void nextTick().then(() => {
+          void saveGridChangesFromShortcut();
+        });
+        return true;
+      },
       editorTheme: editorThemeAccessor,
       appAppearance: editorAppAppearance,
       appPalette: editorAppPalette,
@@ -7858,6 +7897,14 @@ async function syncUserFacingSql() {
 
   try {
     const config = props.connectionId ? connectionStore.getConfig(props.connectionId) : undefined;
+    const footerPage = dataGridUserFacingPage({
+      executedPageLimit: props.executedPageLimit,
+      executedPageOffset: props.executedPageOffset,
+      pageLimit: props.pageLimit,
+      pageOffset: props.pageOffset,
+      fallbackLimit: pageSize.value,
+      fallbackOffset: Math.max(0, currentPage.value - 1) * pageSize.value,
+    });
     const sql = await buildTableSelectSql({
       databaseType: resolvedDatabaseType.value,
       driverProfile: config?.driver_profile,
@@ -7872,8 +7919,8 @@ async function syncUserFacingSql() {
       injectDefaultTimeSeriesWhere: true,
       whereInput: currentWhereInput(),
       orderBy: currentOrderBy(),
-      limit: props.pageLimit ?? pageSize.value,
-      offset: props.pageOffset ?? Math.max(0, currentPage.value - 1) * pageSize.value,
+      limit: footerPage.limit,
+      offset: footerPage.offset,
     });
     if (generation === userFacingSqlGeneration) userFacingSql.value = sqlWithDisplayDatabaseName(sql);
   } catch {
@@ -7882,7 +7929,7 @@ async function syncUserFacingSql() {
 }
 
 watch(
-  () => [props.sql, props.context, props.tableMeta, props.pageLimit, props.pageOffset, currentWhereInput(), currentOrderBy(), settingsStore.editorSettings.generateSqlIncludeDatabaseName],
+  () => [props.sql, props.context, props.tableMeta, props.pageLimit, props.pageOffset, props.executedPageLimit, props.executedPageOffset, currentWhereInput(), currentOrderBy(), settingsStore.editorSettings.generateSqlIncludeDatabaseName],
   () => void syncUserFacingSql(),
   { immediate: true },
 );
@@ -9435,11 +9482,17 @@ function openCellDetailSearch(): boolean {
 async function onGridKeydown(event: KeyboardEvent) {
   if (event.defaultPrevented) return;
 
+  if (isFocusWhereShortcut(event, settingsStore.editorSettings.shortcuts) && focusWhere()) {
+    event.preventDefault();
+    event.stopPropagation();
+    return;
+  }
+
   const targetAllowsNativeClipboard = eventTargetAllowsNativeClipboard(event);
   if (!targetAllowsNativeClipboard && props.context === "table-data" && canOpenTableStructureEditor.value && isEditTableStructureShortcut(event, settingsStore.editorSettings.shortcuts)) {
     event.preventDefault();
     event.stopPropagation();
-    openTableStructureEditor();
+    openTableStructureEditor("columns");
     return;
   }
   if (!targetAllowsNativeClipboard && isGoToColumnShortcut(event, settingsStore.editorSettings.shortcuts) && openGoToColumn()) {
@@ -11529,9 +11582,9 @@ function copyDdl() {
   copyText(ddlContent.value);
 }
 
-function openTableStructureEditor() {
+function openTableStructureEditor(initialTab: TableInfoTab) {
   if (!props.connectionId || !props.database || !props.tableMeta?.tableName || !canOpenTableStructureEditor.value) return;
-  queryStore.openTableStructure(props.connectionId, props.database, props.tableMeta.schema, props.tableMeta.tableName, activeTableInfoTab.value, undefined, props.tableMeta.catalog, (props.tableMeta.tableType || "").toUpperCase() === "VIEW" ? "view" : "table");
+  queryStore.openTableStructure(props.connectionId, props.database, props.tableMeta.schema, props.tableMeta.tableName, initialTab, undefined, props.tableMeta.catalog, (props.tableMeta.tableType || "").toUpperCase() === "VIEW" ? "view" : "table");
 }
 
 function toggleDdlWrap() {
@@ -11895,6 +11948,7 @@ defineExpose({
   setMultiRowTranspose,
   toggleMultiRowTranspose,
   focusSearch,
+  focusWhere,
   openGoToColumn,
   visibleColumnCount,
   displayableColumnCount,
@@ -12396,6 +12450,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
               </template>
               <template v-if="canShowWhereSearch">
                 <DataGridQueryControls
+                  ref="queryControlsRef"
                   v-model:where-input="whereFilterInput"
                   v-model:order-by-input="orderByInput"
                   v-model:filter-builder-open="filterBuilderOpen"
@@ -12463,22 +12518,6 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
           >
             <template #leading>
               <slot v-if="hasResultToolbarActionsSlot" name="result-toolbar-actions" :compact="compactDataGridToolbar" />
-              <Tooltip v-if="props.context === 'table-data' && canOpenTableStructureEditor">
-                <TooltipTrigger as-child>
-                  <Button
-                    data-grid-edit-table-structure-action
-                    variant="ghost"
-                    size="sm"
-                    :class="['data-grid-topbar-action-button h-5 shrink-0 px-1.5 text-xs', compactDataGridToolbar ? 'data-grid-topbar-action-button--compact' : '']"
-                    :aria-label="t('contextMenu.editStructure')"
-                    @click="openTableStructureEditor"
-                  >
-                    <PencilRuler class="data-grid-topbar-action-icon h-3 w-3" />
-                    <span class="data-grid-topbar-action-label" :class="{ 'data-grid-topbar-action-label--compact': compactDataGridToolbar }">{{ t("contextMenu.editStructure") }}</span>
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom">{{ t("contextMenu.editStructure") }}</TooltipContent>
-              </Tooltip>
               <Tooltip v-if="showQueryEditReadOnlyBadge">
                 <TooltipTrigger as-child>
                   <div class="flex h-5 items-center gap-1 rounded border border-muted-foreground/30 bg-muted/60 px-1.5 text-xs font-medium text-muted-foreground">
@@ -12528,7 +12567,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                 <Tooltip>
                   <TooltipTrigger as-child>
                     <PopoverTrigger as-child>
-                      <Button data-toolbar-action="navigation" variant="ghost" size="sm" :class="['data-grid-topbar-action-button h-5 shrink-0 text-xs px-1.5', compact ? 'data-grid-topbar-action-button--compact' : '', goToColumnOpen ? 'text-primary bg-primary/10' : '']">
+                      <Button ref="goToColumnTriggerRef" data-toolbar-action="navigation" variant="ghost" size="sm" :class="['data-grid-topbar-action-button h-5 shrink-0 text-xs px-1.5', compact ? 'data-grid-topbar-action-button--compact' : '', goToColumnOpen ? 'text-primary bg-primary/10' : '']">
                         <Columns3 class="data-grid-topbar-action-icon w-3 h-3" />
                         <span
                           class="data-grid-topbar-action-label"
@@ -12542,7 +12581,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                   </TooltipTrigger>
                   <TooltipContent side="bottom">{{ t("grid.goToColumn") }}</TooltipContent>
                 </Tooltip>
-                <PopoverContent align="end" class="w-56 p-2" @keydown="onGoToColumnKeydown">
+                <PopoverContent :reference="goToColumnTriggerElement()" align="end" class="w-56 p-2" @keydown="onGoToColumnKeydown">
                   <div class="relative mb-1">
                     <Search class="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
                     <input ref="goToColumnSearchInput" v-model="goToColumnSearch" :placeholder="t('grid.searchColumn')" class="h-8 w-full rounded-md border bg-transparent pl-7 pr-6 text-xs outline-none focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25" />
@@ -13971,7 +14010,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                   <span class="table-info-action-label">{{ t("contextMenu.dropAllIndexes") }}</span>
                 </Button>
               </div>
-              <Button v-if="canOpenTableStructureEditor" variant="ghost" size="sm" class="table-info-action-button h-6 px-2 text-xs" :title="t('contextMenu.editStructure')" :aria-label="t('contextMenu.editStructure')" @click="openTableStructureEditor">
+              <Button v-if="canOpenTableStructureEditor" variant="ghost" size="sm" class="table-info-action-button h-6 px-2 text-xs" :title="t('contextMenu.editStructure')" :aria-label="t('contextMenu.editStructure')" @click="openTableStructureEditor(activeTableInfoTab)">
                 <PencilRuler class="w-3 h-3" />
                 <span class="table-info-action-label">{{ t("contextMenu.editStructure") }}</span>
               </Button>
@@ -14162,7 +14201,6 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                     :kind="detailTemporalEditorConfig.kind"
                     :fraction-precision="detailTemporalEditorConfig.fractionPrecision"
                     variant="inline"
-                    :commit-on-close="false"
                     @cancel="cancelValueEditorEdit"
                     @commit="commitValueEditorEdit"
                     @save="onTemporalCellEditorSave"
