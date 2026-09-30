@@ -100,7 +100,6 @@ export const POSTGRES_FUNCTION_SIGNATURES = new Map<string, string[]>([
   ["BOOL_AND", ["expression"]],
   ["BOOL_OR", ["expression"]],
   ["EVERY", ["expression"]],
-  ["MODE", ["...expression"]],
   ["PERCENTILE_CONT", ["fraction"]],
   ["PERCENTILE_DISC", ["fraction"]],
   ["STDDEV", ["expression"]],

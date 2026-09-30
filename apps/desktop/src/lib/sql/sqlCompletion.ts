@@ -1154,7 +1154,7 @@ const MYSQL_FUNCTION_SIGNATURES = new Map<string, string[]>([
 ]);
 
 /** Keywords that may also exist as built-in functions; keep both completion entries. */
-const DUAL_ROLE_SQL_KEYWORDS = new Set(["LEFT", "RIGHT", "IF", "TRUNCATE", "REPEAT", "DATABASE", "SCHEMA", "USER", "CURRENT_USER"]);
+const DUAL_ROLE_SQL_KEYWORDS = new Set(["LEFT", "RIGHT", "IF", "EXISTS", "TRUNCATE", "REPEAT", "DATABASE", "SCHEMA", "USER", "CURRENT_USER"]);
 
 const SQLITE_FUNCTION_SIGNATURES = new Map<string, string[]>([
   ["JSON_EXTRACT", ["json", "path"]],
