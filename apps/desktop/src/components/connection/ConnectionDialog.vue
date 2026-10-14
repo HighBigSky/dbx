@@ -79,9 +79,11 @@ import { applyMeilisearchBasePathToExternalConfig, applyParsedConnectionUrl, nor
 import { loadVisibleDatabasesPickerNames } from "@/lib/connection/visibleDatabasesPickerLoad";
 import { hasXuguConnectionDatabase } from "@/lib/connection/xuguDatabase";
 import {
+  DEFAULT_IDLE_DISCONNECT_ENABLED_SECS,
   DEFAULT_MANUAL_TRANSACTION_TIMEOUT_SECS,
   DEFAULT_QUERY_TIMEOUT_SECS,
   MAX_CONNECT_TIMEOUT_SECS,
+  MAX_IDLE_DISCONNECT_SECS,
   MAX_IDLE_TIMEOUT_SECS,
   MAX_MANUAL_TRANSACTION_TIMEOUT_SECS,
   MAX_QUERY_TIMEOUT_SECS,
@@ -89,7 +91,6 @@ import {
   normalizeManualTransactionTimeoutSecs,
   supportsIdleTimeout,
 } from "@/lib/connection/timeoutLimits";
-import { DEFAULT_QUERY_TIMEOUT_SECS, MAX_CONNECT_TIMEOUT_SECS, MAX_IDLE_DISCONNECT_SECS, MAX_IDLE_TIMEOUT_SECS, MAX_QUERY_TIMEOUT_SECS, supportsIdleTimeout } from "@/lib/connection/timeoutLimits";
 import { buildOracleTnsConnectionString, normalizeOracleTnsAdminPath, parseOracleTnsConnectionString } from "@/lib/connection/oracleTnsConnection";
 import { applyConnectionDeepLinkUpdate, resolveConnectionDeepLinkUpdate } from "@/lib/connection/connectionDeepLinkUpdate";
 import { connectionDeepLinkServiceHydrationValue, parseConnectionDeepLink, parseConnectionDeepLinkUpdate, parseServiceConnectionUrl, type ConnectionDeepLinkDraft, type ConnectionDeepLinkUpdate } from "@/lib/connection/connectionDeepLink";
@@ -811,6 +812,30 @@ const keepaliveEnabled = computed({
     }
   },
 });
+
+const idleDisconnectEnabled = computed({
+  get: () => Number(form.value.idle_disconnect_secs) > 0,
+  set: (enabled: boolean) => {
+    if (enabled) {
+      const current = Number(form.value.idle_disconnect_secs);
+      form.value.idle_disconnect_secs = Number.isFinite(current) && current > 0 ? current : DEFAULT_IDLE_DISCONNECT_ENABLED_SECS;
+    } else {
+      form.value.idle_disconnect_secs = 0;
+    }
+  },
+});
+
+/**
+ * 「空闲自动断开」的软校验：开启后阈值若不大于「保持连接间隔」，保活探测还没来得及跑一次，
+ * 连接就已经被关掉了，等于保活白开。这里只提示、不阻止保存——两者相等或更短的组合仍有
+ * 合理场景（例如用户只是不想要保活），不该把配置挡在门外。
+ */
+const idleDisconnectKeepaliveWarning = computed(() => {
+  const idle = Number(form.value.idle_disconnect_secs);
+  const keepalive = Number(form.value.keepalive_interval_secs);
+  return idle > 0 && keepalive > 0 && idle <= keepalive;
+});
+
 const selectedTransportLayerId = ref<string | null>(null);
 const draggedTransportLayerId = ref<string | null>(null);
 const selectedType = ref("mysql");
@@ -10369,10 +10394,17 @@ function openExternalUrl(url: string) {
                 <!-- 空闲自动断开由后端在连接池层面实现，所有方言均适用，故不做方言门控：
                      即使上面的「空闲超时」被 v-show 隐藏，这里也要展示。 -->
                 <div class="grid grid-cols-4 items-start gap-4">
-                  <Label :class="connectionLabelSmallPaddedClass">{{ t("connection.idleDisconnect") }}</Label>
+                  <Label :class="connectionLabelSmallPaddedClass">
+                    <span class="inline-flex items-center gap-1">{{ t("connection.idleDisconnect") }} <HelpTooltip :label="t('connection.idleDisconnectHint')" content-class="max-w-[280px]" /></span>
+                  </Label>
                   <div class="col-span-3 space-y-1">
-                    <Input v-model.number="form.idle_disconnect_secs" type="number" min="0" :max="MAX_IDLE_DISCONNECT_SECS" step="1" @input="clampIdleDisconnectInput($event)" />
-                    <p class="text-xs leading-5 text-muted-foreground">{{ t("connection.idleDisconnectHint") }}</p>
+                    <div class="flex items-center gap-2">
+                      <Switch v-model="idleDisconnectEnabled" />
+                      <Input v-model.number="form.idle_disconnect_secs" type="number" min="1" :max="MAX_IDLE_DISCONNECT_SECS" step="1" class="flex-1" :disabled="!idleDisconnectEnabled" @input="clampIdleDisconnectInput($event)" />
+                    </div>
+                    <p v-if="idleDisconnectKeepaliveWarning" class="rounded-md border border-amber-500/30 bg-amber-500/5 px-2 py-1 text-xs leading-5 text-amber-700 dark:text-amber-400">
+                      {{ t("connection.idleDisconnectKeepaliveWarning") }}
+                    </p>
                   </div>
                 </div>
                 <div class="grid grid-cols-4 items-center gap-4">

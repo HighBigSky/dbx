@@ -56,7 +56,18 @@ describe("ConnectionDialog timeout controls", () => {
     // supportsIdleTimeout 之类的判断。
     expect(dialogSource).toContain("clampIdleDisconnectInput($event)");
     expect(dialogSource).toContain('t("connection.idleDisconnect")');
-    expect(dialogSource).toContain('t("connection.idleDisconnectHint")');
     expect(dialogSource).toContain('v-model.number="form.idle_disconnect_secs"');
+    // 开关+输入框与「保持连接间隔」一行保持一致；说明文案收进小问号 tooltip，
+    // 避免和「空闲超时」的说明挤在一起。
+    expect(dialogSource).toContain('v-model="idleDisconnectEnabled"');
+    expect(dialogSource).toContain(':disabled="!idleDisconnectEnabled"');
+    expect(dialogSource).toContain(":label=\"t('connection.idleDisconnectHint')\"");
+  });
+
+  it("warns when the idle auto-disconnect threshold can never beat keepalive", () => {
+    // 软校验：阈值不大于「保持连接间隔」时给出提示，但不阻止保存。
+    expect(dialogSource).toContain("idleDisconnectKeepaliveWarning");
+    expect(dialogSource).toContain('t("connection.idleDisconnectKeepaliveWarning")');
+    expect(dialogSource).toContain("const idleDisconnectKeepaliveWarning = computed");
   });
 });

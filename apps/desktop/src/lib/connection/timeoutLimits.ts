@@ -15,6 +15,9 @@ export const MAX_MANUAL_TRANSACTION_TIMEOUT_SECS = 86400;
 // 空闲会话，不再沿用 idle_timeout 的 3600 以免过早关闭用户有意保留的连接池。
 export const DEFAULT_IDLE_DISCONNECT_SECS = 0;
 export const MAX_IDLE_DISCONNECT_SECS = 86400;
+// 用户把「空闲自动断开」开关打开时填入的初值。取 300 秒（5 分钟）：既明显大于「保持连接间隔」
+// 的默认 30 秒（否则一开启就落在保活之前、保活等于白开），又不至于长到让人以为没生效。
+export const DEFAULT_IDLE_DISCONNECT_ENABLED_SECS = 300;
 
 export function normalizeConnectTimeoutSecs(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_CONNECT_TIMEOUT_SECS;
