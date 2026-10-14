@@ -149,7 +149,8 @@ fn mysql_family_structure_search_sql(
          SELECT TABLE_SCHEMA AS object_schema, TABLE_NAME AS object_name, NULL AS column_name, \
          NULL AS column_comment, TABLE_COMMENT AS table_comment \
          FROM information_schema.TABLES \
-         WHERE LOWER(COALESCE(TABLE_COMMENT, '')) LIKE LOWER({}) ESCAPE '~' \
+         WHERE TABLE_TYPE = 'BASE TABLE' \
+         AND LOWER(COALESCE(TABLE_COMMENT, '')) LIKE LOWER({}) ESCAPE '~' \
          {schema_filter} \
          AND {system_schemas} \
          ORDER BY object_schema, object_name, column_name \
@@ -518,6 +519,9 @@ mod tests {
         assert!(query.sql.contains("information_schema.TABLES"));
         assert!(query.sql.contains("TABLE_COMMENT AS table_comment"));
         assert!(query.sql.contains("LIMIT 80"));
+        // MySQL 家族的视图在 information_schema.TABLES 里的 TABLE_COMMENT 是字面量 'VIEW'，
+        // 必须按 BASE TABLE 过滤，否则搜索包含 "view" 子串的词会把所有视图误报为表级命中。
+        assert!(query.sql.contains("TABLE_TYPE = 'BASE TABLE'"));
     }
 
     #[test]
