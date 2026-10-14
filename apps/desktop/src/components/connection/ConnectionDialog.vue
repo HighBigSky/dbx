@@ -89,6 +89,7 @@ import {
   normalizeManualTransactionTimeoutSecs,
   supportsIdleTimeout,
 } from "@/lib/connection/timeoutLimits";
+import { DEFAULT_QUERY_TIMEOUT_SECS, MAX_CONNECT_TIMEOUT_SECS, MAX_IDLE_DISCONNECT_SECS, MAX_IDLE_TIMEOUT_SECS, MAX_QUERY_TIMEOUT_SECS, supportsIdleTimeout } from "@/lib/connection/timeoutLimits";
 import { buildOracleTnsConnectionString, normalizeOracleTnsAdminPath, parseOracleTnsConnectionString } from "@/lib/connection/oracleTnsConnection";
 import { applyConnectionDeepLinkUpdate, resolveConnectionDeepLinkUpdate } from "@/lib/connection/connectionDeepLinkUpdate";
 import { connectionDeepLinkServiceHydrationValue, parseConnectionDeepLink, parseConnectionDeepLinkUpdate, parseServiceConnectionUrl, type ConnectionDeepLinkDraft, type ConnectionDeepLinkUpdate } from "@/lib/connection/connectionDeepLink";
@@ -435,6 +436,8 @@ const defaultForm = (): ConnectionForm => ({
   query_timeout_inherit: true,
   idle_timeout_secs: 60,
   manual_transaction_timeout_secs: DEFAULT_MANUAL_TRANSACTION_TIMEOUT_SECS,
+  // 空闲自动断开默认不启用（0）。
+  idle_disconnect_secs: 0,
   keepalive_interval_secs: 30,
   ssl: false,
   ca_cert_path: "",
@@ -3133,6 +3136,7 @@ watch(
         query_timeout_inherit: config.query_timeout_inherit === true,
         idle_timeout_secs: config.idle_timeout_secs ?? 60,
         manual_transaction_timeout_secs: normalizeManualTransactionTimeoutSecs(config.manual_transaction_timeout_secs),
+        idle_disconnect_secs: config.idle_disconnect_secs ?? 0,
         keepalive_interval_secs: config.keepalive_interval_secs ?? 30,
         sysdba: config.sysdba || isOracleSysUser(config),
         oracle_oci_nls_lang: config.oracle_oci_nls_lang || "",
@@ -4861,6 +4865,7 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     config.query_timeout_inherit = form.value.query_timeout_inherit;
     config.idle_timeout_secs = form.value.idle_timeout_secs;
     config.manual_transaction_timeout_secs = normalizeManualTransactionTimeoutSecs(form.value.manual_transaction_timeout_secs);
+    config.idle_disconnect_secs = form.value.idle_disconnect_secs;
     config.keepalive_interval_secs = form.value.keepalive_interval_secs;
     config.read_only = form.value.read_only;
     config.save_password = form.value.save_password;
@@ -6632,6 +6637,15 @@ function clampIdleTimeoutInput(event: Event) {
   if (!Number.isFinite(value) || value <= MAX_IDLE_TIMEOUT_SECS) return;
   input.value = String(MAX_IDLE_TIMEOUT_SECS);
   form.value.idle_timeout_secs = MAX_IDLE_TIMEOUT_SECS;
+}
+
+function clampIdleDisconnectInput(event: Event) {
+  const input = event.target as HTMLInputElement;
+  if (input.value === "") return;
+  const value = Number(input.value);
+  if (!Number.isFinite(value) || value <= MAX_IDLE_DISCONNECT_SECS) return;
+  input.value = String(MAX_IDLE_DISCONNECT_SECS);
+  form.value.idle_disconnect_secs = MAX_IDLE_DISCONNECT_SECS;
 }
 
 async function persistGlobalTimeoutDrafts() {
@@ -10350,6 +10364,15 @@ function openExternalUrl(url: string) {
                   <div class="col-span-3 space-y-1">
                     <Input v-model.number="form.manual_transaction_timeout_secs" type="number" :min="MIN_MANUAL_TRANSACTION_TIMEOUT_SECS" :max="MAX_MANUAL_TRANSACTION_TIMEOUT_SECS" step="1" />
                     <p class="text-xs leading-5 text-muted-foreground">{{ t("connection.manualTransactionTimeoutHint", { min: MIN_MANUAL_TRANSACTION_TIMEOUT_SECS, max: MAX_MANUAL_TRANSACTION_TIMEOUT_SECS }) }}</p>
+                  </div>
+                </div>
+                <!-- 空闲自动断开由后端在连接池层面实现，所有方言均适用，故不做方言门控：
+                     即使上面的「空闲超时」被 v-show 隐藏，这里也要展示。 -->
+                <div class="grid grid-cols-4 items-start gap-4">
+                  <Label :class="connectionLabelSmallPaddedClass">{{ t("connection.idleDisconnect") }}</Label>
+                  <div class="col-span-3 space-y-1">
+                    <Input v-model.number="form.idle_disconnect_secs" type="number" min="0" :max="MAX_IDLE_DISCONNECT_SECS" step="1" @input="clampIdleDisconnectInput($event)" />
+                    <p class="text-xs leading-5 text-muted-foreground">{{ t("connection.idleDisconnectHint") }}</p>
                   </div>
                 </div>
                 <div class="grid grid-cols-4 items-center gap-4">

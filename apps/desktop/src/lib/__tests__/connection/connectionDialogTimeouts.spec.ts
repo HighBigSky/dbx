@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_IDLE_TIMEOUT_SECS, MAX_IDLE_TIMEOUT_SECS, normalizeConnectTimeoutSecs, normalizeIdleTimeoutSecs, supportsIdleTimeout } from "@/lib/connection/timeoutLimits";
+import { DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_IDLE_DISCONNECT_SECS, DEFAULT_IDLE_TIMEOUT_SECS, MAX_IDLE_DISCONNECT_SECS, MAX_IDLE_TIMEOUT_SECS, normalizeConnectTimeoutSecs, normalizeIdleDisconnectSecs, normalizeIdleTimeoutSecs, supportsIdleTimeout } from "@/lib/connection/timeoutLimits";
 
 const dialogSource = readFileSync(new URL("../../../components/connection/ConnectionDialog.vue", import.meta.url), "utf8");
 
@@ -17,6 +17,17 @@ describe("ConnectionDialog timeout controls", () => {
     expect(normalizeIdleTimeoutSecs(60)).toBe(60);
     expect(normalizeIdleTimeoutSecs(120.4)).toBe(120);
     expect(normalizeIdleTimeoutSecs(5000)).toBe(MAX_IDLE_TIMEOUT_SECS);
+  });
+
+  it("defaults auto-disconnect-when-idle to disabled and bounds its values", () => {
+    // 0 是合法值（不启用），必须与非法输入区分：只有非数字/NaN/负数才回落默认 0。
+    expect(normalizeIdleDisconnectSecs("")).toBe(DEFAULT_IDLE_DISCONNECT_SECS);
+    expect(normalizeIdleDisconnectSecs(Number.NaN)).toBe(DEFAULT_IDLE_DISCONNECT_SECS);
+    expect(normalizeIdleDisconnectSecs(-1)).toBe(DEFAULT_IDLE_DISCONNECT_SECS);
+    expect(normalizeIdleDisconnectSecs(0)).toBe(0);
+    expect(normalizeIdleDisconnectSecs(300)).toBe(300);
+    expect(normalizeIdleDisconnectSecs(120.4)).toBe(120);
+    expect(normalizeIdleDisconnectSecs(999999)).toBe(MAX_IDLE_DISCONNECT_SECS);
   });
 
   it("identifies database dialects that support idle connection timeouts", () => {
@@ -38,5 +49,14 @@ describe("ConnectionDialog timeout controls", () => {
     expect(dialogSource).toContain('v-show="supportsIdleTimeoutSetting"');
     expect(dialogSource).toContain("clampIdleTimeoutInput($event)");
     expect(dialogSource).toContain('t("connection.idleTimeoutHint")');
+  });
+
+  it("binds the auto-disconnect-when-idle input for every dialect", () => {
+    // 该输入框不做方言门控：不挂在 supportsIdleTimeoutSetting 的 v-show 块内，也没用
+    // supportsIdleTimeout 之类的判断。
+    expect(dialogSource).toContain("clampIdleDisconnectInput($event)");
+    expect(dialogSource).toContain('t("connection.idleDisconnect")');
+    expect(dialogSource).toContain('t("connection.idleDisconnectHint")');
+    expect(dialogSource).toContain('v-model.number="form.idle_disconnect_secs"');
   });
 });
