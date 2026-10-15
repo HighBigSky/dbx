@@ -76,7 +76,10 @@ pub fn build_database_structure_search_sql(
             oracle_family_structure_search_sql(options.schema.as_deref(), &options.database, &pattern_literal, limit)
         }
         DatabaseType::SqlServer => sqlserver_structure_search_sql(options.schema.as_deref(), &pattern_literal, limit),
-        DatabaseType::Tdengine => tdengine_structure_search_sql(&options.database, &pattern_literal, limit),
+        // TDengine 没有 ESCAPE 语法，无法复用上面的转义模式，单独构造 "%term%"。
+        DatabaseType::Tdengine => {
+            tdengine_structure_search_sql(&options.database, &tdengine_like_pattern_literal(&term), limit)
+        }
         DatabaseType::Snowflake => snowflake_structure_search_sql(options.schema.as_deref(), &pattern_literal, limit),
         // gbase8s is Informix-compatible (see the table_structure_sql dialects)
         // and has no information_schema; only MySQL-dialect Gbase 8a takes this path.
@@ -355,34 +358,34 @@ fn sqlserver_structure_search_sql(schema: Option<&str>, pattern_literal: &str, l
 }
 
 fn tdengine_structure_search_sql(database: &str, pattern_literal: &str, limit: usize) -> String {
-    // TDengine 的表注释来自 information_schema.ins_tables（普通表/子表）与 ins_stables（超级表），
-    // 两个分支各自限额后与列命中合并；列命中分支缺少表注释，用空串占位保持各分支列数与类型一致。
-    // TDengine 的 ORDER BY 只作用于最近的 SELECT，因此再包一层子查询做统一排序与总限量。
+    // TDengine 的表注释来自 information_schema.ins_tables（普通表/子表）与 ins_stables（超级表）。
+    // 这里要遵守 TDengine 的三条语法约束：
+    // 1. LIMIT 只能出现在完整 query_expression（顶层语句或带括号的子查询）上，裸的 UNION 分支
+    //    不能各自带 LIMIT，因此每个分支都写成 `( SELECT ... LIMIT n )` 子查询；
+    // 2. 语法里没有 ESCAPE 子句，无法转义 %/_，模式直接使用 "%term%"（%/_ 按通配符处理），
+    //    精确匹配由前端在结果集上二次过滤，避免过度裁剪真实命中；
+    // 3. ins_columns 没有 note 列，TDengine 也没有列注释，因此列命中只匹配 col_name。
     let table_limit = table_comment_search_limit(limit);
     let db = sql_string_literal(database);
     format!(
-        "SELECT * FROM ( \
-         SELECT db_name AS object_schema, table_name AS object_name, col_name AS column_name, \
-         note AS column_comment, '' AS table_comment \
+        "( SELECT db_name AS object_schema, table_name AS object_name, col_name AS column_name, \
+         '' AS column_comment, '' AS table_comment \
          FROM information_schema.ins_columns \
-         WHERE db_name = {db} \
-         AND (LOWER(col_name) LIKE LOWER({pattern}) ESCAPE '~' OR LOWER(COALESCE(note, '')) LIKE LOWER({pattern}) ESCAPE '~') \
-         LIMIT {limit} \
+         WHERE db_name = {db} AND LOWER(col_name) LIKE {pattern} \
+         LIMIT {limit} ) \
          UNION ALL \
-         SELECT db_name AS object_schema, table_name AS object_name, '' AS column_name, \
+         ( SELECT db_name AS object_schema, table_name AS object_name, '' AS column_name, \
          '' AS column_comment, table_comment AS table_comment \
          FROM information_schema.ins_tables \
-         WHERE db_name = {db} AND table_comment IS NOT NULL \
-         AND LOWER(table_comment) LIKE LOWER({pattern}) ESCAPE '~' \
-         LIMIT {table_limit} \
+         WHERE db_name = {db} AND table_comment IS NOT NULL AND LOWER(table_comment) LIKE {pattern} \
+         LIMIT {table_limit} ) \
          UNION ALL \
-         SELECT db_name AS object_schema, stable_name AS object_name, '' AS column_name, \
+         ( SELECT db_name AS object_schema, stable_name AS object_name, '' AS column_name, \
          '' AS column_comment, table_comment AS table_comment \
          FROM information_schema.ins_stables \
-         WHERE db_name = {db} AND table_comment IS NOT NULL \
-         AND LOWER(table_comment) LIKE LOWER({pattern}) ESCAPE '~' \
-         LIMIT {table_limit} \
-         ) ORDER BY object_schema, object_name, column_name \
+         WHERE db_name = {db} AND table_comment IS NOT NULL AND LOWER(table_comment) LIKE {pattern} \
+         LIMIT {table_limit} ) \
+         ORDER BY object_schema, object_name, column_name \
          LIMIT {total_limit}",
         db = db,
         pattern = pattern_literal,
@@ -390,6 +393,12 @@ fn tdengine_structure_search_sql(database: &str, pattern_literal: &str, limit: u
         table_limit = table_limit,
         total_limit = limit + table_limit,
     )
+}
+
+/// TDengine 的 LIKE 语法没有 ESCAPE 子句，无法转义 `%`/`_`，因此直接使用 `%term%` 模式，
+/// 让 `%`/`_` 按通配符处理；精确匹配由前端在结果集上二次过滤，避免把带通配符的词条误判为精确子串。
+fn tdengine_like_pattern_literal(term: &str) -> String {
+    sql_string_literal(&format!("%{}%", clean_term(term).to_ascii_lowercase()))
 }
 
 fn snowflake_structure_search_sql(schema: Option<&str>, pattern_literal: &str, limit: usize) -> String {
@@ -662,7 +671,7 @@ mod tests {
 
     #[test]
     fn tdengine_structure_search_matches_table_comments() {
-        // TDengine 的表注释来自 ins_tables（普通表/子表）与 ins_stables（超级表）。
+        // TDengine 表注释来自 ins_tables（普通表/子表）与 ins_stables（超级表）。
         let query = build_database_structure_search_sql(DatabaseStructureSearchSqlOptions {
             database_type: Some(DatabaseType::Tdengine),
             driver_profile: None,
@@ -677,6 +686,15 @@ mod tests {
         assert!(query.sql.contains("information_schema.ins_stables"));
         assert!(query.sql.contains("table_comment IS NOT NULL"));
         assert!(query.sql.contains("db_name = 'pm'"));
+        // LIMIT 只能挂在括号子查询上：每个 UNION 分支都要自带括号（40 与 40/4=10）。
+        assert_eq!(query.sql.matches("( SELECT").count(), 3);
+        assert!(query.sql.contains("LIMIT 40 )"));
+        assert!(query.sql.contains("LIMIT 10 )"));
+        assert!(query.sql.contains("LIMIT 50"));
+        // TDengine 语法没有 ESCAPE，也没有列注释（ins_columns 没有 note 列），只匹配 col_name。
+        assert!(!query.sql.contains("ESCAPE"));
+        assert!(!query.sql.contains("note"));
+        assert!(query.sql.contains("LOWER(col_name) LIKE '%meter%'"));
     }
 
     #[test]
