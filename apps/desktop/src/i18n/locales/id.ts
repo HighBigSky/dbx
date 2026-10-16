@@ -2830,6 +2830,7 @@ export default withEnglishFallback({
     setNull: "Atur NULL",
     restoreOriginalValue: "Pulihkan Asli",
     copyColumnName: "Salin Nama Kolom",
+    copyColumnComment: "Salin Komentar Kolom",
     columnDragChipMany: "{names} ({count} kolom)",
     copyAlterColumnSql: "Salin sebagai SQL ALTER",
     alterSqlCopied: "SQL ALTER disalin ke clipboard",

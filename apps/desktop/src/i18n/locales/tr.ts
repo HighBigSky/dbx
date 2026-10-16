@@ -2516,6 +2516,7 @@ export default withEnglishFallback({
     setNull: "NULL Yap",
     restoreOriginalValue: "Özgün Değeri Geri Yükle",
     copyColumnName: "Sütun Adını Kopyala",
+    copyColumnComment: "Sütun Açıklamasını Kopyala",
     columnDragChipMany: "{names} ({count} sütun)",
     copyAlterColumnSql: "SQL ALTER Olarak Kopyala",
     alterSqlCopied: "SQL ALTER panoya kopyalandı",

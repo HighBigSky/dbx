@@ -3294,6 +3294,7 @@ export default {
     setNull: "Set NULL",
     restoreOriginalValue: "Restore Original",
     copyColumnName: "Copy Column Name",
+    copyColumnComment: "Copy Column Comment",
     columnDragChipMany: "{names} ({count} columns)",
     copyAlterColumnSql: "Copy as SQL ALTER",
     alterSqlCopied: "SQL ALTER copied to clipboard",

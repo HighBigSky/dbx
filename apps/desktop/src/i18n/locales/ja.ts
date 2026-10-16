@@ -2849,6 +2849,7 @@ export default withEnglishFallback({
     setNull: "NULLに設定",
     restoreOriginalValue: "元の値に戻す",
     copyColumnName: "列名をコピー",
+    copyColumnComment: "列コメントをコピー",
     columnDragChipMany: "{names}（全{count}列）",
     copyAlterColumnSql: "SQL ALTERとしてコピー",
     alterSqlCopied: "SQL ALTERをクリップボードにコピーしました",
