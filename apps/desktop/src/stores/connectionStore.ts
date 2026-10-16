@@ -719,6 +719,9 @@ export const useConnectionStore = defineStore("connection", () => {
   const cancelledLocalConnectionAttempts = new Map<string, Set<number>>();
   const successfulLocalConnectionAttempts = new Map<string, number>();
   const connectionStateRevisions = new Map<string, number>();
+  // 每个连接最近一次「建立会话」的本地墙钟时间（Unix 毫秒）。用于识别后端空闲自动断开
+  // 事件的迟到：若连接时间晚于事件里的 `closedAtMs`，说明事件描述的是上一个会话。
+  const connectionConnectedAtMs = new Map<string, number>();
   const connectionErrorRevisions = new Map<string, number>();
   const tableListSourceRevisions = new Map<string, number>();
   const treeNodeLoads = new TreeNodeLoadRegistry();
@@ -4756,7 +4759,7 @@ export const useConnectionStore = defineStore("connection", () => {
       await ensureLocalConnectionAttemptActiveAfterConnectResult(config.id, localAttempt, id);
       passwordChangeReconnectRequired.delete(config.id);
       activeConnectionId.value = id;
-      connectedIds.value.add(id);
+      markConnectionConnected(id);
       // 显式连接成功即结束"用户已关闭"状态：页签界面随后的被动唤醒可以正常参与。
       clearConnectionClosedByUser(config.id);
       clearConnectionClosedByUser(id);
@@ -4909,6 +4912,17 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   /**
+   * 把连接标记为已连接，并记录本次会话建立的本地墙钟时间。
+   *
+   * 所有「连上」的路径都必须走这里，否则 `handleConnectionIdleClosed` 无法判断后端事件是否
+   * 早于当前会话（见该函数的「迟到事件」说明）。
+   */
+  function markConnectionConnected(connectionId: string): void {
+    connectedIds.value.add(connectionId);
+    connectionConnectedAtMs.set(connectionId, Date.now());
+  }
+
+  /**
    * 处理后端「空闲自动断开」事件（issue #12112）：某连接的连接池因空闲超过
    * `idle_disconnect_secs` 被后端关闭。
    *
@@ -4920,12 +4934,19 @@ export const useConnectionStore = defineStore("connection", () => {
    *
    * 空值与幂等保护：缺少 connectionId、连接配置已删除、或该连接本就不在已连接集合中时
    * 直接返回，既不抛异常也不重复弹提示（后端可能对同一次断开重复发送事件）。
+   *
+   * 迟到事件保护：事件通道（web 端 SSE 尤其）可能有缓冲，事件可能在连接已经重新建立之后
+   * 才到达；此时它描述的是上一个会话，直接忽略。否则会把刚建好的新会话一并断掉，并弹出
+   * 误导性的「已空闲断开」提示。缺少 `closedAtMs`（旧后端）时退回原行为。
    */
   async function handleConnectionIdleClosed(payload: ConnectionIdleClosedEvent): Promise<void> {
     const connectionId = payload?.connectionId;
     if (!connectionId) return;
     // 已不在已连接集合（用户已手动断开，或此前已处理过该事件）时忽略，避免重复 toast。
     if (!connectedIds.value.has(connectionId)) return;
+    const closedAtMs = Number(payload.closedAtMs);
+    const connectedAtMs = connectionConnectedAtMs.get(connectionId);
+    if (Number.isFinite(closedAtMs) && connectedAtMs !== undefined && connectedAtMs > closedAtMs) return;
     const config = getConfig(connectionId);
     if (!config) return;
     await disconnect(connectionId, { skipTabHandling: true, markClosedByUser: false });
@@ -5204,7 +5225,7 @@ export const useConnectionStore = defineStore("connection", () => {
       await ensureLocalConnectionAttemptActiveAfterConnectResult(connectionId, localAttempt, id);
       await syncMongoLegacyDriverFallback(connectionId, config);
       await ensureLocalConnectionAttemptActiveAfterConnectResult(connectionId, localAttempt, id);
-      connectedIds.value.add(connectionId);
+      markConnectionConnected(connectionId);
       // 任何路径真的连上之后，"用户已关闭"标记就不能再拦后续的被动唤醒。
       clearConnectionClosedByUser(connectionId);
       if (config.db_type !== "plugin") {
@@ -10545,7 +10566,7 @@ export const useConnectionStore = defineStore("connection", () => {
     if (!connections.value.find((c) => c.id === normalized.id)) {
       connections.value.push(normalized);
     }
-    connectedIds.value.add(normalized.id);
+    markConnectionConnected(normalized.id);
     markConnectionHealthChecked(normalized.id);
     clearConnectionError(normalized.id);
   }
@@ -10655,6 +10676,7 @@ export const useConnectionStore = defineStore("connection", () => {
     markConnectionOffline,
     handleConnectionLivenessMessage,
     handleConnectionIdleClosed,
+    markConnectionConnected,
     metadataGenerationFor,
     disconnectAndForgetConnectionPassword,
     retirePasswordAfterChange,

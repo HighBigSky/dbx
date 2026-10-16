@@ -52,6 +52,12 @@ pub enum ConnectionLivenessMessage {
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionIdleClosedEvent {
     pub connection_id: String,
+    /// 关闭发生的墙钟时间（Unix 毫秒）。
+    ///
+    /// 前端用它识别「迟到事件」：SSE / 事件通道都有缓冲，事件可能在本连接已经重新建立
+    /// 之后才到达；此时这次断开描述的已经是上一个会话，前端应忽略，否则会连带关掉刚建好
+    /// 的新会话。用墙钟而非 `Instant` 是因为要跨进程（web 端是浏览器与服务端）比较。
+    pub closed_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

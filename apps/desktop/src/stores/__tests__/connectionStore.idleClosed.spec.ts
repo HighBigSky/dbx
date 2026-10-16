@@ -79,7 +79,7 @@ describe("connectionStore idle auto-disconnect", () => {
     const store = useConnectionStore();
     const config = connection();
     store.connections = [config];
-    store.connectedIds.add(config.id);
+    store.markConnectionConnected(config.id);
     return store;
   }
 
@@ -136,5 +136,34 @@ describe("connectionStore idle auto-disconnect", () => {
     expect(disconnectDb).not.toHaveBeenCalled();
     expect(toast).not.toHaveBeenCalled();
     expect(store.connectedIds.has("c1")).toBe(true);
+  });
+
+  // 迟到事件：清扫发生在本次会话之前，事件到达时用户已经重连。丢掉这次通知即可，
+  // 绝不能把刚建立的新会话一起断掉（否则会连带杀掉新池并弹出误导性提示）。
+  it("ignores a late event for a connection that was already reconnected", async () => {
+    const store = await loadStore();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(2_000_000);
+    store.markConnectionConnected("c1");
+    nowSpy.mockRestore();
+
+    await store.handleConnectionIdleClosed({ connectionId: "c1", closedAtMs: 1_000_000 });
+
+    expect(disconnectDb).not.toHaveBeenCalled();
+    expect(toast).not.toHaveBeenCalled();
+    expect(store.connectedIds.has("c1")).toBe(true);
+  });
+
+  // 反之，事件晚于当前会话时就该正常处理——避免上面的守卫把合法事件也吞掉。
+  it("still disconnects when the event is newer than the current session", async () => {
+    const store = await loadStore();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    store.markConnectionConnected("c1");
+    nowSpy.mockRestore();
+
+    await store.handleConnectionIdleClosed({ connectionId: "c1", closedAtMs: 1_500_000 });
+
+    expect(disconnectDb).toHaveBeenCalledWith("c1", undefined);
+    expect(toast).toHaveBeenCalledTimes(1);
+    expect(store.connectedIds.has("c1")).toBe(false);
   });
 });

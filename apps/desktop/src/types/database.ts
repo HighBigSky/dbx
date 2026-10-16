@@ -288,8 +288,11 @@ export type ConnectionLivenessMessage = { kind: "lost"; connectionId: string; fa
 /**
  * 后端「空闲自动断开」事件（`dbx:connection-idle-closed`）的载荷：某个连接的连接池因空闲
  * 超过 `idle_disconnect_secs` 被后端自动关闭。前端收到后把该连接标记为未连接并保留页签。
+ *
+ * `closedAtMs` 是后端关闭时的墙钟时间（Unix 毫秒）：事件通道可能有缓冲，若本连接在事件
+ * 到达之前已经重新建立，说明这次断开描述的是上一个会话，前端必须忽略，否则会关掉新会话。
  */
-export type ConnectionIdleClosedEvent = { connectionId: string };
+export type ConnectionIdleClosedEvent = { connectionId: string; closedAtMs?: number };
 
 export type TransportLayerConfig = ({ type: "ssh" } & SshTunnelConfig) | ({ type: "proxy" } & ProxyTunnelConfig) | ({ type: "http_tunnel" } & HttpTunnelConfig);
 

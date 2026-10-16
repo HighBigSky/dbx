@@ -478,6 +478,14 @@ fn pool_activity_now_ms() -> u64 {
     POOL_ACTIVITY_BASE_MS + pool_activity_epoch().elapsed().as_millis() as u64
 }
 
+/// 当前墙钟时间（Unix 毫秒）。
+///
+/// 与 `pool_activity_now_ms` 的单调时钟不同：后者只在进程内可比，而空闲断开事件要跨进程与
+/// 前端比较（web 端是浏览器与服务端两个进程），因此必须用墙钟。
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 struct PoolActivity {
     last_used_at_ms: std::sync::atomic::AtomicU64,
@@ -6094,8 +6102,11 @@ impl AppState {
                 "[connection][idle_disconnect] connection '{connection_id}' pools closed after {idle_disconnect_secs}s without query activity"
             );
             // 发布给各 shell 转发到前端；发送失败（没有任何订阅者）不影响关闭本身。
-            let _ =
-                self.connection_idle_closed.send(ConnectionIdleClosedEvent { connection_id: connection_id.clone() });
+            // 带上墙钟时间，供前端识别「迟到事件」：若本连接的建立时间晚于该时刻，说明
+            // 事件描述的是上一个会话，前端应忽略，避免连带关掉刚重连出来的新会话。
+            let _ = self
+                .connection_idle_closed
+                .send(ConnectionIdleClosedEvent { connection_id: connection_id.clone(), closed_at_ms: unix_now_ms() });
             closed.push(connection_id);
         }
 
@@ -10599,7 +10610,12 @@ for line in sys.stdin:
 
         let event = events.try_recv().expect("idle-closed event must be published");
         assert_eq!(event.connection_id, "conn");
-        assert_eq!(serde_json::to_value(&event).unwrap(), serde_json::json!({ "connectionId": "conn" }));
+        // 载荷必须与前端类型一致：camelCase 的 `connectionId` / `closedAtMs`，其中墙钟时间
+        // 供前端识别迟到事件（见 `unix_now_ms` 的说明）。
+        assert!(event.closed_at_ms > 0, "the event must carry a wall-clock close time");
+        let payload = serde_json::to_value(&event).unwrap();
+        assert_eq!(payload["connectionId"], "conn");
+        assert!(payload["closedAtMs"].as_u64().is_some_and(|value| value > 0));
 
         let _ = std::fs::remove_dir_all(dir);
     }
