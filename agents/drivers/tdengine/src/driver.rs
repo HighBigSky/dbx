@@ -20,7 +20,13 @@ use crate::model::{
 };
 use crate::value::borrowed_value_to_json;
 
-const TABLE_CACHE_TTL: Duration = Duration::from_secs(10);
+/// 表列表缓存有效期。
+///
+/// 大库（数十万子表）上一次全量元数据扫描可能耗时数秒到数十秒，而侧栏分页每点一次
+/// 「加载更多」都会再请求一页；TTL 过短会导致翻页期间缓存已失效、重复全量扫描，
+/// 既慢又可能因两次扫描的快照差异让 offset 跳行（#13317）。本连接内执行 DDL 时
+/// 仍会立即清空缓存，其他客户端造成的元数据变化最多延迟到 TTL 到期。
+const TABLE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const QUERY_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -509,11 +515,7 @@ impl TdengineDriver {
         let mut tables = self
             .query_tables(&format!("SHOW {}STABLES", quote_qualified_prefix(database)), "STABLE", false, token)
             .await?;
-        tables.extend(
-            self.query_tables(&format!("SHOW {}TABLES", quote_qualified_prefix(database)), "TABLE", true, token)
-                .await?,
-        );
-        self.enrich_table_parents(database, &mut tables, token).await?;
+        tables.extend(self.query_child_tables(database, token).await?);
         let mut seen = HashSet::new();
         tables.retain(|table| seen.insert(format!("{}:{}", table.table_type, table.name)));
         sort_tables_for_hierarchy(&mut tables);
@@ -522,38 +524,26 @@ impl TdengineDriver {
         Ok(tables)
     }
 
-    async fn enrich_table_parents(
-        &self,
-        database: &str,
-        tables: &mut [TableInfo],
-        token: &CancellationToken,
-    ) -> Result<()> {
-        if !tables.iter().any(|table| table.table_type == "TABLE" && table.parent_name.is_none()) {
-            return Ok(());
-        }
+    /// 读取数据库下的普通表和子表，并尽量带上所属超级表名。
+    ///
+    /// 优先查 `information_schema.ins_tables`：一次扫描就能同时得到表名和 `stable_name`，
+    /// 避免先 `SHOW TABLES` 再全量扫描一遍 `ins_tables` 来补齐父表（大库上这是主要耗时点，
+    /// 见 #13317）。仅当该查询失败（极旧版本或权限受限）时，才退回 `SHOW TABLES`，
+    /// 按第四列尽力读取所属超级表；TDengine 3.x 的 `SHOW TABLES` 没有该列，此时表仍会
+    /// 全部列出，只是不会折叠到超级表下面。
+    async fn query_child_tables(&self, database: &str, token: &CancellationToken) -> Result<Vec<TableInfo>> {
         let sql = format!(
             "SELECT table_name, stable_name FROM information_schema.ins_tables WHERE db_name = {}",
             quote_literal(database)
         );
-        let rows = match self.query_rows(&sql, token, 0).await {
-            Ok(rows) => rows,
-            Err(error) if token.is_cancelled() => return Err(error),
-            Err(_) => return Ok(()),
-        };
-        let parents = rows
-            .into_iter()
-            .filter_map(|row| {
-                let table = row.first().and_then(json_text)?.to_ascii_lowercase();
-                let parent = row.get(1).and_then(json_text)?.trim();
-                (!parent.is_empty()).then(|| (table, parent.to_string()))
-            })
-            .collect::<HashMap<_, _>>();
-        for table in tables {
-            if table.table_type == "TABLE" && table.parent_name.is_none() {
-                table.parent_name = parents.get(&table.name.to_ascii_lowercase()).cloned();
+        match self.query_rows(&sql, token, 0).await {
+            Ok(rows) => Ok(tables_from_information_schema_rows(rows)),
+            Err(error) if token.is_cancelled() => Err(error),
+            Err(_) => {
+                self.query_tables(&format!("SHOW {}TABLES", quote_qualified_prefix(database)), "TABLE", true, token)
+                    .await
             }
         }
-        Ok(())
     }
 
     async fn query_tables(
@@ -778,6 +768,30 @@ fn table_from_show_row(row: Vec<Value>, table_type: &str, includes_stable_name: 
         .then(|| row.get(3).and_then(json_text).map(str::trim).filter(|value| !value.is_empty()).map(str::to_string))
         .flatten();
     Some(TableInfo { name, table_type: table_type.to_string(), comment: None, parent_schema: None, parent_name })
+}
+
+/// 把 `information_schema.ins_tables` 的两列结果（`table_name`、`stable_name`）转成表信息。
+///
+/// `stable_name` 为空表示普通表，不属于任何超级表；空白值按空处理，避免把空格当成父表名。
+/// 该结果同时承担「表列表」和「父表映射」两个职责，因此不再需要额外的 `ins_tables` 扫描。
+fn tables_from_information_schema_rows(rows: Vec<Vec<Value>>) -> Vec<TableInfo> {
+    rows.into_iter()
+        .filter_map(|row| {
+            let name = row.first().and_then(json_text)?;
+            if name.is_empty() {
+                return None;
+            }
+            let parent_name =
+                row.get(1).and_then(json_text).map(str::trim).filter(|value| !value.is_empty()).map(str::to_string);
+            Some(TableInfo {
+                name: name.to_string(),
+                table_type: "TABLE".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name,
+            })
+        })
+        .collect()
 }
 
 fn parse_describe_columns(rows: Vec<Vec<Value>>) -> Vec<ColumnInfo> {
@@ -1087,6 +1101,53 @@ mod tests {
         let table =
             table_from_show_row(vec![json!("d1001"), json!("x"), json!("x"), json!("meters")], "TABLE", true).unwrap();
         assert_eq!(table.parent_name.as_deref(), Some("meters"));
+    }
+
+    #[test]
+    fn maps_information_schema_rows_to_child_tables() {
+        let tables = tables_from_information_schema_rows(vec![
+            vec![json!("d1"), json!("meters")],
+            vec![json!("plain"), json!("")],
+            vec![json!("padded"), json!("   ")],
+            vec![json!("d2"), Value::Null],
+            vec![Value::Null, json!("meters")],
+        ]);
+        assert_eq!(tables.len(), 4);
+        assert!(tables.iter().all(|table| table.table_type == "TABLE"));
+        assert_eq!(tables[0].parent_name.as_deref(), Some("meters"));
+        assert_eq!(tables[1].parent_name, None);
+        assert_eq!(tables[2].parent_name, None);
+        assert_eq!(tables[3].parent_name, None);
+    }
+
+    #[test]
+    fn pages_over_sorted_snapshot_without_gaps_or_overlaps() {
+        let table = |name: &str, parent: Option<&str>| TableInfo {
+            name: name.into(),
+            table_type: "TABLE".into(),
+            comment: None,
+            parent_schema: None,
+            parent_name: parent.map(str::to_string),
+        };
+        let mut snapshot = vec![
+            table("meters", None),
+            table("d2", Some("meters")),
+            table("d1", Some("meters")),
+            table("logs", None),
+            table("d3", Some("meters")),
+        ];
+        sort_tables_for_hierarchy(&mut snapshot);
+
+        let mut paged = Vec::new();
+        let page_size = 2;
+        for offset in (0..snapshot.len()).step_by(page_size) {
+            let page = filter_tables(
+                snapshot.clone(),
+                &MetadataListConstraints { limit: page_size, offset, ..MetadataListConstraints::default() },
+            );
+            paged.extend(page.into_iter().map(|table| table.name));
+        }
+        assert_eq!(paged, snapshot.iter().map(|table| table.name.clone()).collect::<Vec<_>>());
     }
 
     #[test]
