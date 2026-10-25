@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -20,13 +22,26 @@ use crate::model::{
 };
 use crate::value::borrowed_value_to_json;
 
-/// 表列表缓存有效期。
+/// 表列表快照的兜底有效期。
 ///
-/// 大库（数十万子表）上一次全量元数据扫描可能耗时数秒到数十秒，而侧栏分页每点一次
-/// 「加载更多」都会再请求一页；TTL 过短会导致翻页期间缓存已失效、重复全量扫描，
-/// 既慢又可能因两次扫描的快照差异让 offset 跳行（#13317）。本连接内执行 DDL 时
-/// 仍会立即清空缓存，其他客户端造成的元数据变化最多延迟到 TTL 到期。
-const TABLE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+/// 本进程内执行的可能改变元数据的 SQL 会立刻让快照失效，这里只兜住「其他客户端/其他
+/// 实例」造成的元数据变化：最长延迟一分钟能看到新表。大库扫描很贵，不能按每次翻页重扫。
+const TABLE_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// 进程级表快照缓存。
+///
+/// core 的侧栏翻页会为每次请求新开一个 ephemeral metadata session（随机 session id，
+/// 请求结束即关闭，见 `crates/dbx-core/src/schema/mod.rs` 的 `EphemeralAgentMetadataSession`），
+/// driver 随该会话创建和销毁，实例级缓存无法跨请求命中。快照因此放到进程级，按
+/// 「连接指纹 + 数据库」复用；键里带连接指纹，避免多个连接共用同一 agent 进程时串数据。
+static TABLE_SNAPSHOTS: LazyLock<StdMutex<HashMap<String, TableSnapshot>>> = LazyLock::new(Default::default);
+
+/// 元数据代数。
+///
+/// 任一会话执行 CREATE/DROP/ALTER 等语句后自增，使其他会话里已缓存的快照立即失效，
+/// 避免「在 SQL 编辑器里建了表，侧栏却要等 TTL 才看得到」。
+static METADATA_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 const QUERY_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -37,13 +52,14 @@ pub struct TdengineDriver {
     session_timezone: Option<Tz>,
     current_database: String,
     query_sessions: HashMap<String, QueryCursor>,
-    table_cache: Option<TableCache>,
 }
 
-struct TableCache {
-    database: String,
+struct TableSnapshot {
     loaded_at: Instant,
-    tables: Vec<TableInfo>,
+    /// 生成该快照时的 `METADATA_GENERATION`，与当前值不一致即视为过期。
+    generation: u64,
+    /// 共享给所有分页请求，命中缓存时只增加引用计数，不复制整份列表。
+    tables: Arc<Vec<TableInfo>>,
 }
 
 struct QueryCursor {
@@ -70,7 +86,6 @@ impl TdengineDriver {
             session_timezone: None,
             current_database: String::new(),
             query_sessions: HashMap::new(),
-            table_cache: None,
         }
     }
 
@@ -107,7 +122,6 @@ impl TdengineDriver {
 
     pub async fn disconnect(&mut self) {
         self.query_sessions.clear();
-        self.table_cache = None;
         self.server_version = None;
         self.session_timezone = None;
         self.current_database.clear();
@@ -164,11 +178,10 @@ impl TdengineDriver {
             return Ok(Vec::new());
         }
         let database = effective_database(database, &self.current_database)?.to_string();
-        // `SHOW <db>.TABLES` / `SHOW <db>.STABLES` are unordered, so a server-side page
-        // offset can skip or repeat rows between two requests. Always read the full
-        // (sorted, cached) list and slice it locally instead.
+        // 元数据接口的返回顺序没有保证，服务端翻页会让 offset 在两次请求间跳行；
+        // 这里始终读取完整列表（进程级快照），在本地排序切片。
         let tables = self.all_tables(&database, token).await?;
-        Ok(filter_tables(tables, &constraints))
+        Ok(filter_tables(tables.as_slice(), &constraints))
     }
 
     pub async fn list_objects(
@@ -301,16 +314,17 @@ impl TdengineDriver {
                 continue;
             }
             if include_tables {
-                for table in self.all_tables(&database, token).await? {
+                let tables = self.all_tables(&database, token).await?;
+                for table in tables.iter() {
                     if completion_matches(&table.name, &request) {
                         candidates.push(CompletionAssistantCandidate {
-                            name: table.name,
+                            name: table.name.clone(),
                             kind: "table".into(),
                             database: Some(database.clone()),
                             schema: Some(database.clone()),
                             parent_schema: None,
-                            parent_name: table.parent_name,
-                            comment: table.comment,
+                            parent_name: table.parent_name.clone(),
+                            comment: table.comment.clone(),
                             data_type: None,
                         });
                     }
@@ -332,7 +346,7 @@ impl TdengineDriver {
         let (_, truncated) = cursor.prepare_next_page(token, options.timeout_secs).await?;
         page.truncated = truncated;
         if may_change_metadata(&options.sql) {
-            self.table_cache = None;
+            invalidate_table_snapshots();
         }
         Ok(QueryResult {
             columns: page.columns,
@@ -366,7 +380,7 @@ impl TdengineDriver {
         }
         page.execution_time_ms = start.elapsed().as_millis() as i64;
         if may_change_metadata(&options.sql) {
-            self.table_cache = None;
+            invalidate_table_snapshots();
         }
         Ok(page)
     }
@@ -424,7 +438,7 @@ impl TdengineDriver {
             affected_rows += i64::from(result_set.affected_rows());
         }
         if statements.iter().any(|statement| may_change_metadata(statement)) {
-            self.table_cache = None;
+            invalidate_table_snapshots();
         }
         Ok(QueryResult {
             columns: Vec::new(),
@@ -506,44 +520,74 @@ impl TdengineDriver {
         Ok(rows)
     }
 
-    async fn all_tables(&mut self, database: &str, token: &CancellationToken) -> Result<Vec<TableInfo>> {
-        if let Some(cache) = &self.table_cache {
-            if cache.database == database && cache.loaded_at.elapsed() <= TABLE_CACHE_TTL {
-                return Ok(cache.tables.clone());
-            }
+    async fn all_tables(&self, database: &str, token: &CancellationToken) -> Result<Arc<Vec<TableInfo>>> {
+        let cache_key = self.table_cache_key(database);
+        let generation = METADATA_GENERATION.load(Ordering::Relaxed);
+        if let Some(tables) = cached_table_snapshot(&cache_key, generation) {
+            return Ok(tables);
         }
         let mut tables = self
             .query_tables(&format!("SHOW {}STABLES", quote_qualified_prefix(database)), "STABLE", false, token)
             .await?;
-        tables.extend(self.query_child_tables(database, token).await?);
+        if uses_information_schema_tables(self.server_version.as_deref()) {
+            tables.extend(self.query_information_schema_tables(database, token).await?);
+        } else {
+            // 2.x 的 SHOW TABLES 第 4 列就是所属超级表名，不需要额外的元数据扫描。
+            tables.extend(
+                self.query_tables(&format!("SHOW {}TABLES", quote_qualified_prefix(database)), "TABLE", true, token)
+                    .await?,
+            );
+        }
         let mut seen = HashSet::new();
         tables.retain(|table| seen.insert(format!("{}:{}", table.table_type, table.name)));
         sort_tables_for_hierarchy(&mut tables);
-        self.table_cache =
-            Some(TableCache { database: database.to_string(), loaded_at: Instant::now(), tables: tables.clone() });
+        let tables = Arc::new(tables);
+        store_table_snapshot(&cache_key, generation, tables.clone());
         Ok(tables)
     }
 
-    /// 读取数据库下的普通表和子表，并尽量带上所属超级表名。
+    /// 快照缓存键：连接指纹 + 数据库名。
     ///
-    /// 优先查 `information_schema.ins_tables`：一次扫描就能同时得到表名和 `stable_name`，
-    /// 避免先 `SHOW TABLES` 再全量扫描一遍 `ins_tables` 来补齐父表（大库上这是主要耗时点，
-    /// 见 #13317）。仅当该查询失败（极旧版本或权限受限）时，才退回 `SHOW TABLES`，
-    /// 按第四列尽力读取所属超级表；TDengine 3.x 的 `SHOW TABLES` 没有该列，此时表仍会
-    /// 全部列出，只是不会折叠到超级表下面。
-    async fn query_child_tables(&self, database: &str, token: &CancellationToken) -> Result<Vec<TableInfo>> {
+    /// 一个 agent 进程可能承载多个连接，必须带上连接信息；密码不参与，避免把凭据
+    /// 长期留在进程全局状态里。
+    fn table_cache_key(&self, database: &str) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            self.params.host,
+            self.params.port,
+            self.params.username,
+            database,
+            self.params.connection_string,
+            self.params.url_params,
+            self.params.ssl
+        )
+    }
+
+    /// 读取数据库下的普通表和子表，并带上所属超级表名。
+    ///
+    /// `information_schema.ins_tables` 一次扫描就能同时得到表名和 `stable_name`，
+    /// 避免先 `SHOW TABLES` 再全量扫描一遍 `ins_tables` 补齐父表（大库上的主要耗时点）。
+    /// 该查询失败时重试一次而不是退回 `SHOW TABLES`：3.x 的 `SHOW TABLES` 没有
+    /// `stable_name`，退回会让排序键从「按超级表分组」变成「按表名」，翻页时正是
+    /// 会出现重复或漏表。仍失败则把错误抛给调用方，让侧栏显示错误而不是残缺列表。
+    async fn query_information_schema_tables(
+        &self,
+        database: &str,
+        token: &CancellationToken,
+    ) -> Result<Vec<TableInfo>> {
         let sql = format!(
             "SELECT table_name, stable_name FROM information_schema.ins_tables WHERE db_name = {}",
             quote_literal(database)
         );
-        match self.query_rows(&sql, token, 0).await {
-            Ok(rows) => Ok(tables_from_information_schema_rows(rows)),
-            Err(error) if token.is_cancelled() => Err(error),
-            Err(_) => {
-                self.query_tables(&format!("SHOW {}TABLES", quote_qualified_prefix(database)), "TABLE", true, token)
-                    .await
+        let mut last_error = None;
+        for _ in 0..2 {
+            match self.query_rows(&sql, token, 0).await {
+                Ok(rows) => return Ok(tables_from_information_schema_rows(rows)),
+                Err(error) if token.is_cancelled() => return Err(error),
+                Err(error) => last_error = Some(error),
             }
         }
+        Err(last_error.unwrap_or_else(|| anyhow!("TDengine table metadata query failed")))
     }
 
     async fn query_tables(
@@ -841,12 +885,12 @@ fn character_length(data_type: &str) -> Option<u32> {
         .find_map(|prefix| type_numbers(&lower, prefix).map(|(length, _)| length))
 }
 
-fn filter_tables(tables: Vec<TableInfo>, constraints: &MetadataListConstraints) -> Vec<TableInfo> {
+fn filter_tables(tables: &[TableInfo], constraints: &MetadataListConstraints) -> Vec<TableInfo> {
     let filter = constraints.filter.trim().to_ascii_lowercase();
     let mut skipped = 0usize;
     let limit = if constraints.limit == 0 { usize::MAX } else { constraints.limit };
     tables
-        .into_iter()
+        .iter()
         .filter(|table| table_type_allowed(&constraints.object_types, &table.table_type))
         .filter(|table| {
             text_matches(&table.name, &filter)
@@ -858,6 +902,7 @@ fn filter_tables(tables: Vec<TableInfo>, constraints: &MetadataListConstraints) 
             include
         })
         .take(limit)
+        .cloned()
         .collect()
 }
 
@@ -923,6 +968,34 @@ fn sort_tables_for_hierarchy(tables: &mut [TableInfo]) {
             .then_with(|| left.parent_name.is_some().cmp(&right.parent_name.is_some()))
             .then_with(|| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase()))
     });
+}
+
+/// 3.x 起 `SHOW TABLES` 只返回 3 列（没有 `stable_name`），必须走 `information_schema`；
+/// 2.x 继续用 `SHOW TABLES`，避免多跑一次注定失败的查询。版本号探测失败时按 3.x 处理。
+fn uses_information_schema_tables(server_version: Option<&str>) -> bool {
+    let major =
+        server_version.and_then(|version| version.split('.').next()).and_then(|major| major.parse::<u32>().ok());
+    matches!(major, None | Some(3..))
+}
+
+/// 读取未过期的表快照；只克隆 `Arc`，不复制列表本身。
+fn cached_table_snapshot(cache_key: &str, generation: u64) -> Option<Arc<Vec<TableInfo>>> {
+    let snapshots = TABLE_SNAPSHOTS.lock().expect("TDengine table snapshot cache lock poisoned");
+    let snapshot = snapshots.get(cache_key)?;
+    (snapshot.generation == generation && snapshot.loaded_at.elapsed() < TABLE_CACHE_TTL)
+        .then(|| snapshot.tables.clone())
+}
+
+/// 写入表快照，并顺带清掉已过期的条目，避免进程长时间运行后无限增长。
+fn store_table_snapshot(cache_key: &str, generation: u64, tables: Arc<Vec<TableInfo>>) {
+    let mut snapshots = TABLE_SNAPSHOTS.lock().expect("TDengine table snapshot cache lock poisoned");
+    snapshots.retain(|_, snapshot| snapshot.loaded_at.elapsed() < TABLE_CACHE_TTL);
+    snapshots.insert(cache_key.to_string(), TableSnapshot { loaded_at: Instant::now(), generation, tables });
+}
+
+/// 元数据发生变化的 SQL 执行成功后调用：让本进程内所有会话的表快照立即失效。
+fn invalidate_table_snapshots() {
+    METADATA_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
 fn build_fallback_table_ddl(database: &str, table: &str, columns: &[ColumnInfo]) -> String {
@@ -1142,12 +1215,30 @@ mod tests {
         let page_size = 2;
         for offset in (0..snapshot.len()).step_by(page_size) {
             let page = filter_tables(
-                snapshot.clone(),
+                &snapshot,
                 &MetadataListConstraints { limit: page_size, offset, ..MetadataListConstraints::default() },
             );
             paged.extend(page.into_iter().map(|table| table.name));
         }
         assert_eq!(paged, snapshot.iter().map(|table| table.name.clone()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn routes_table_metadata_by_server_version() {
+        // 3.x 与探测失败都走 information_schema（SHOW TABLES 缺 stable_name）。
+        assert!(uses_information_schema_tables(Some("3.2.3.0")));
+        assert!(uses_information_schema_tables(Some("3.0.0.0")));
+        assert!(uses_information_schema_tables(None));
+        // 2.x 继续用 SHOW TABLES，避免多一次注定失败的查询。
+        assert!(!uses_information_schema_tables(Some("2.6.0.0")));
+    }
+
+    #[test]
+    fn drops_snapshots_when_metadata_generation_changes() {
+        let key = "test|generation|tdengine";
+        store_table_snapshot(key, 7, Arc::new(vec![]));
+        assert!(cached_table_snapshot(key, 7).is_some());
+        assert!(cached_table_snapshot(key, 8).is_none());
     }
 
     #[test]
