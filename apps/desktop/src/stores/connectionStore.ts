@@ -5862,7 +5862,7 @@ export const useConnectionStore = defineStore("connection", () => {
           const children = buildXuguTablespaceChildren(targetNode, tablespaces);
           setChildren(targetNode, children);
           targetNode.objectCount = children.length;
-          targetNode.isExpanded = true;
+          if (sidebarAutoExpandTreeOnConnect()) targetNode.isExpanded = true;
         } catch (error) {
           // Storage metadata is an optional, read-only enhancement. A user
           // without SYS_* view access should see an empty group rather than a
@@ -5872,7 +5872,7 @@ export const useConnectionStore = defineStore("connection", () => {
           if (targetNode) {
             setChildren(targetNode, []);
             targetNode.objectCount = 0;
-            targetNode.isExpanded = true;
+            if (sidebarAutoExpandTreeOnConnect()) targetNode.isExpanded = true;
           }
         } finally {
           finishTreeNodeLoad(load);
@@ -6146,7 +6146,7 @@ export const useConnectionStore = defineStore("connection", () => {
       // reveal the rest on demand, unless the user explicitly asked to see all.
       const { visible, hasMore } = options?.showAll ? { visible: databaseNodes, hasMore: false } : limitRedisDatabaseList(databaseNodes, useSettingsStore().editorSettings.redisDatabaseDisplayLimit);
       setChildren(targetNode, withSavedSqlRoot(connectionId, hasMore ? [...visible, buildLoadMoreNode(targetNode, visible.length, databaseNodes.length - visible.length)] : visible, targetNode));
-      targetNode.isExpanded = true;
+      if (sidebarAutoExpandTreeOnConnect()) targetNode.isExpanded = true;
     });
   }
 
@@ -6190,7 +6190,7 @@ export const useConnectionStore = defineStore("connection", () => {
         );
       }
       setChildren(targetNode, withSavedSqlRoot(connectionId, children, targetNode));
-      targetNode.isExpanded = true;
+      if (sidebarAutoExpandTreeOnConnect()) targetNode.isExpanded = true;
     });
   }
 
@@ -6217,7 +6217,7 @@ export const useConnectionStore = defineStore("connection", () => {
           targetNode,
         ),
       );
-      targetNode.isExpanded = true;
+      if (sidebarAutoExpandTreeOnConnect()) targetNode.isExpanded = true;
     });
   }
 
@@ -6253,7 +6253,7 @@ export const useConnectionStore = defineStore("connection", () => {
           targetNode,
         ),
       );
-      targetNode.isExpanded = true;
+      if (sidebarAutoExpandTreeOnConnect()) targetNode.isExpanded = true;
     });
   }
 
@@ -6275,7 +6275,7 @@ export const useConnectionStore = defineStore("connection", () => {
         isExpanded: false,
       };
       setChildren(node, [consoleNode]);
-      node.isExpanded = true;
+      if (sidebarAutoExpandTreeOnConnect()) node.isExpanded = true;
     } catch (e) {
       recordMetadataLoadError(connectionId, e);
       throw e;
@@ -6324,7 +6324,7 @@ export const useConnectionStore = defineStore("connection", () => {
         );
       }
       const liveNode = treeNodeLoadTarget(load);
-      if (liveNode) liveNode.isExpanded = true;
+      if (sidebarAutoExpandTreeOnConnect() && liveNode) liveNode.isExpanded = true;
     });
   }
 
@@ -6375,7 +6375,7 @@ export const useConnectionStore = defineStore("connection", () => {
         });
       }
       setChildren(targetNode, children);
-      targetNode.isExpanded = true;
+      if (sidebarAutoExpandTreeOnConnect()) targetNode.isExpanded = true;
     });
   }
 
@@ -6439,7 +6439,7 @@ export const useConnectionStore = defineStore("connection", () => {
         ),
         { trustEmptyConnectionChildren: dbs.length > 0 && visibleDbs.length === 0 },
       );
-      targetNode.isExpanded = true;
+      if (sidebarAutoExpandTreeOnConnect()) targetNode.isExpanded = true;
     } catch (e) {
       recordMetadataLoadError(connectionId, e, load);
       throw e;
@@ -6475,7 +6475,7 @@ export const useConnectionStore = defineStore("connection", () => {
             isExpanded: false,
           })),
       );
-      targetNode.isExpanded = true;
+      if (sidebarAutoExpandTreeOnConnect()) targetNode.isExpanded = true;
     } catch (e) {
       recordMetadataLoadError(connectionId, e, load);
       throw e;
@@ -6553,7 +6553,7 @@ export const useConnectionStore = defineStore("connection", () => {
           targetNode,
         ),
       );
-      targetNode.isExpanded = true;
+      if (sidebarAutoExpandTreeOnConnect()) targetNode.isExpanded = true;
     } catch (e) {
       const targetNode = treeNodeLoadTarget(load);
       if (targetNode && getConfig(connectionId)?.db_type === "meilisearch") {
@@ -6576,7 +6576,7 @@ export const useConnectionStore = defineStore("connection", () => {
             targetNode,
           ),
         );
-        targetNode.isExpanded = true;
+        if (sidebarAutoExpandTreeOnConnect()) targetNode.isExpanded = true;
       }
       recordMetadataLoadError(connectionId, e, load);
       throw e;
@@ -6607,7 +6607,7 @@ export const useConnectionStore = defineStore("connection", () => {
           targetNode,
         ),
       );
-      targetNode.isExpanded = true;
+      if (sidebarAutoExpandTreeOnConnect()) targetNode.isExpanded = true;
     });
   }
 
@@ -6633,7 +6633,7 @@ export const useConnectionStore = defineStore("connection", () => {
       const targetNode = treeNodeLoadTarget(load);
       if (!targetNode) return;
       setChildren(targetNode, isMilvus && database ? collectionChildren : withSavedSqlRoot(connectionId, collectionChildren, targetNode));
-      targetNode.isExpanded = true;
+      if (sidebarAutoExpandTreeOnConnect()) targetNode.isExpanded = true;
     });
   }
 
@@ -6671,7 +6671,7 @@ export const useConnectionStore = defineStore("connection", () => {
       const targetNode = treeNodeLoadTarget(load);
       if (!targetNode) return;
       setChildren(targetNode, children);
-      targetNode.isExpanded = true;
+      if (sidebarAutoExpandTreeOnConnect()) targetNode.isExpanded = true;
     } catch (e) {
       recordMetadataLoadError(connectionId, e, load);
       throw e;

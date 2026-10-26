@@ -2756,7 +2756,6 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editSidebarPinDefaultDatabase.value = DEFAULT_EDITOR_SETTINGS.sidebarPinDefaultDatabase;
     editSidebarBrowseObjectsOnDatabaseActivation.value = DEFAULT_EDITOR_SETTINGS.sidebarBrowseObjectsOnDatabaseActivation;
     editSidebarExpandTreeOnConnect.value = DEFAULT_EDITOR_SETTINGS.sidebarExpandTreeOnConnect;
-    editSidebarExpandTreeOnConnect.value = DEFAULT_EDITOR_SETTINGS.sidebarExpandTreeOnConnect;
     editOpenTabsRestoreMode.value = DEFAULT_EDITOR_SETTINGS.openTabsRestoreMode;
     editAutoReloadRestoredDataTabsOnOpen.value = DEFAULT_EDITOR_SETTINGS.autoReloadRestoredDataTabsOnOpen;
     editDisconnectTabHandlingMode.value = DEFAULT_EDITOR_SETTINGS.disconnectTabHandlingMode;
