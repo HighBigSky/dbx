@@ -2393,13 +2393,14 @@ async function finishPendingAppClose(action: AppCloseAction) {
     showAiRunsClosePrompt.value = true;
     return;
   }
-  aiRunsQuitConfirmed = false;
   // 后台任务（传输/导出等）运行中：退出会硬切断任务且无法恢复，先确认（#13281）。
+  // 两个确认都通过后再重置标志，否则确认完后台任务会再次弹出 AI 运行确认。
   if (action === "quit" && !backgroundTasksQuitConfirmed && activeBackgroundTaskCount.value > 0) {
     pendingAppCloseAction.value = action;
     showBackgroundTasksClosePrompt.value = true;
     return;
   }
+  aiRunsQuitConfirmed = false;
   backgroundTasksQuitConfirmed = false;
   if (pendingCloseActionChoice.value) {
     pendingCloseActionChoice.value = false;

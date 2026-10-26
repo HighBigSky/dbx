@@ -401,7 +401,7 @@ function finishDataTransferTask(task: ExportTask) {
   if (task.status === "Done") {
     appendTaskLogLine(task, "transfer.log.completed", "success", { total: task.totalTables ?? 0, failed: task.transferFailures?.length ?? 0 });
   } else if (task.status === "Cancelled") {
-    appendTaskLogLine(task, "transfer.log.cancelled", "info", { index: task.tableIndex ?? 0, total: task.totalTables ?? 0 });
+    appendTaskLogLine(task, "transfer.log.cancelled", "info", { index: (task.tableIndex ?? 0) + 1, total: task.totalTables ?? 0 });
   } else if (task.status === "Error") {
     appendTaskLogLine(task, "transfer.log.failed", "error", { error: task.errorMessage || "" });
   }
